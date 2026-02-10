@@ -119,14 +119,14 @@ def init_keyboard_listener():
     """
     Initializes a non-blocking keyboard listener for real-time user interaction.
 
-    This function sets up a listener for specific keys (right arrow, left arrow, escape) to control
+    This function sets up a listener for specific keys (right arrow, left arrow, escape, enter) to control
     the program flow during execution, such as stopping recording or exiting loops. It gracefully
     handles headless environments where keyboard listening is not possible.
 
     Returns:
         A tuple containing:
         - The `pynput.keyboard.Listener` instance, or `None` if in a headless environment.
-        - A dictionary of event flags (e.g., `exit_early`) that are set by key presses.
+        - A dictionary of event flags (e.g., `exit_early`, `start_next_episode`) that are set by key presses.
     """
     # Allow to exit early while recording an episode or resetting the environment,
     # by tapping the right arrow key '->'. This might require a sudo permission
@@ -135,6 +135,7 @@ def init_keyboard_listener():
     events["exit_early"] = False
     events["rerecord_episode"] = False
     events["stop_recording"] = False
+    events["start_next_episode"] = False
 
     if is_headless():
         logging.warning(
@@ -159,6 +160,9 @@ def init_keyboard_listener():
                 print("Escape key pressed. Stopping data recording...")
                 events["stop_recording"] = True
                 events["exit_early"] = True
+            elif key == keyboard.Key.enter:
+                print("Enter key pressed. Starting next episode...")
+                events["start_next_episode"] = True
         except Exception as e:
             print(f"Error handling key press: {e}")
 

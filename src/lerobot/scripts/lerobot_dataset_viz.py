@@ -271,14 +271,28 @@ def main():
         help="If set, display compressed images in Rerun instead of uncompressed ones.",
     )
 
+    parser.add_argument(
+        "--video-backend",
+        type=str,
+        default=None,
+        help=(
+            "Video backend to use for decoding videos. Options: 'torchcodec', 'pyav', 'video_reader'. "
+            "Defaults to 'torchcodec' when available; otherwise defaults to 'pyav'. "
+            "Use 'pyav' if torchcodec fails to load."
+        ),
+    )
+
     args = parser.parse_args()
     kwargs = vars(args)
     repo_id = kwargs.pop("repo_id")
     root = kwargs.pop("root")
     tolerance_s = kwargs.pop("tolerance_s")
+    video_backend = kwargs.pop("video_backend")
 
     logging.info("Loading dataset")
-    dataset = LeRobotDataset(repo_id, episodes=[args.episode_index], root=root, tolerance_s=tolerance_s)
+    dataset = LeRobotDataset(
+        repo_id, episodes=[args.episode_index], root=root, tolerance_s=tolerance_s, video_backend=video_backend
+    )
 
     visualize_dataset(dataset, **vars(args))
 

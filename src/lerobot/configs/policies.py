@@ -17,6 +17,7 @@ import json
 import os
 import tempfile
 from dataclasses import dataclass, field
+import json
 from logging import getLogger
 from pathlib import Path
 from typing import Any, TypeVar
@@ -162,7 +163,11 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
 
     def _save_pretrained(self, save_directory: Path) -> None:
         with open(save_directory / CONFIG_NAME, "w") as f, draccus.config_type("json"):
-            draccus.dump(self, f, indent=4)
+            # Manually add the 'type' field since draccus.dump doesn't serialize @property
+            
+            config_dict = draccus.encode(self)
+            config_dict = {"type": self.type, **config_dict}
+            json.dump(config_dict, f, indent=4)
 
     @classmethod
     def from_pretrained(

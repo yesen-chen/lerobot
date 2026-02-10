@@ -53,3 +53,4 @@ class RTCConfig:
             raise ValueError(f"max_guidance_weight must be positive, got {self.max_guidance_weight}")
         if self.debug_maxlen <= 0:
             raise ValueError(f"debug_maxlen must be positive, got {self.debug_maxlen}")
+

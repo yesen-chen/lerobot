@@ -488,6 +488,62 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         with VideoEncodingManager(dataset):
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
+                # Allow teleoperation/reset before starting each episode (including the first one)
+                if recorded_episodes == 0:
+                    log_say("Prepare the environment. You can teleoperate the robot. Press Enter when ready to start recording the first episode", cfg.play_sounds)
+                else:
+                    log_say("Reset the environment. You can teleoperate the robot. Press Enter when ready to start recording the next episode", cfg.play_sounds)
+                
+                # reset g1 robot
+                if robot.name == "unitree_g1":
+                    robot.reset()
+                
+                events["start_next_episode"] = False
+                if not is_headless():
+                    print("\n>>> You can teleoperate the robot to prepare the environment <<<")
+                    print(">>> Press ENTER when ready to start recording <<<\n")
+                    # Allow teleoperation while waiting for Enter key
+                    # Run record_loop without dataset to enable teleoperation but not record data
+                    while not events["start_next_episode"] and not events["stop_recording"]:
+                        start_loop_t = time.perf_counter()
+                        
+                        # Get robot observation
+                        obs = robot.get_observation()
+                        obs_processed = robot_observation_processor(obs)
+                        
+                        # Get action from teleop
+                        if teleop is not None:
+                            if isinstance(teleop, Teleoperator):
+                                act = teleop.get_action()
+                                act_processed_teleop = teleop_action_processor((act, obs))
+                            elif isinstance(teleop, list):
+                                teleop_arm = next((t for t in teleop if not isinstance(t, KeyboardTeleop)), None)
+                                teleop_keyboard = next((t for t in teleop if isinstance(t, KeyboardTeleop)), None)
+                                arm_action = teleop_arm.get_action()
+                                arm_action = {f"arm_{k}": v for k, v in arm_action.items()}
+                                keyboard_action = teleop_keyboard.get_action()
+                                base_action = robot._from_keyboard_to_base_action(keyboard_action)
+                                act = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
+                                act_processed_teleop = teleop_action_processor((act, obs))
+                            
+                            robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
+                            robot.send_action(robot_action_to_send)
+                        
+                        if cfg.display_data:
+                            log_rerun_data(
+                                observation=obs_processed, action=act_processed_teleop, compress_images=display_compressed_images
+                            )
+                        
+                        dt_s = time.perf_counter() - start_loop_t
+                        precise_sleep(max(1 / cfg.dataset.fps - dt_s, 0.0))
+                else:
+                    # In headless mode, wait for reset_time_s before starting
+                    print(f"Headless mode: Waiting {cfg.dataset.reset_time_s} seconds before starting episode...")
+                    time.sleep(cfg.dataset.reset_time_s)
+                
+                if events["stop_recording"]:
+                    break
+                
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
                 record_loop(
                     robot=robot,
@@ -506,30 +562,6 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     display_data=cfg.display_data,
                     display_compressed_images=display_compressed_images,
                 )
-
-                # Execute a few seconds without recording to give time to manually reset the environment
-                # Skip reset for the last episode to be recorded
-                if not events["stop_recording"] and (
-                    (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
-                ):
-                    log_say("Reset the environment", cfg.play_sounds)
-
-                    # reset g1 robot
-                    if robot.name == "unitree_g1":
-                        robot.reset()
-
-                    record_loop(
-                        robot=robot,
-                        events=events,
-                        fps=cfg.dataset.fps,
-                        teleop_action_processor=teleop_action_processor,
-                        robot_action_processor=robot_action_processor,
-                        robot_observation_processor=robot_observation_processor,
-                        teleop=teleop,
-                        control_time_s=cfg.dataset.reset_time_s,
-                        single_task=cfg.dataset.single_task,
-                        display_data=cfg.display_data,
-                    )
 
                 if events["rerecord_episode"]:
                     log_say("Re-record episode", cfg.play_sounds)

@@ -1,0 +1,59 @@
+数据采集：
+
+lerobot-record \
+    --robot.type=so101_follower \
+    --robot.port=/dev/ttyACM0 \
+    --robot.id=my_follower_arm \
+    --robot.cameras='{front: {type: opencv, index_or_path: "/dev/video2", width: 640, height: 480, fps: 30}, wrist: {type: opencv, index_or_path: "/dev/video0", width: 640, height: 480, fps: 30}}' \
+    --teleop.type=so101_leader \
+    --teleop.port=/dev/ttyACM1 \
+    --teleop.id=my_leader_arm \
+    --dataset.repo_id=zhang/0209_pick_doll_place \
+    --dataset.num_episodes=10 \
+    --dataset.single_task="pick_doll_place" \
+    --display_data=true
+
+
+
+数据采集resume指令：
+
+lerobot-record \
+    --robot.type=so101_follower \
+    --robot.port=/dev/ttyACM0 \
+    --robot.id=my_follower_arm \
+    --robot.cameras='{front: {type: opencv, index_or_path: "/dev/video2", width: 640, height: 480, fps: 30}, wrist: {type: opencv, index_or_path: "/dev/video0", width: 640, height: 480, fps: 30}}' \
+    --teleop.type=so101_leader \
+    --teleop.port=/dev/ttyACM1 \
+    --teleop.id=my_leader_arm \
+    --dataset.repo_id=zhang/0209_pick_doll_place \
+    --dataset.num_episodes=10 \
+    --dataset.single_task="pick_doll_place" \
+    --display_data=true \
+    --resume=true \
+    --dataset.num_episodes=7
+
+
+
+查看数据集中已采集轨迹数量：
+
+python -c "from lerobot.datasets.lerobot_dataset import LeRobotDataset; ds = LeRobotDataset('zhang/0209_pick_doll_place'); print(f'已录制: {ds.meta.total_episodes} 集')"
+
+
+
+机器人replay动作
+lerobot-replay \
+    --robot.type=so101_follower \
+    --robot.port=/dev/ttyACM0 \
+    --robot.id=my_follower_arm \
+    --dataset.repo_id=zhang/0209_pick_doll_place \
+    --dataset.episode=0
+
+
+
+rerun可视化采集的数据集
+lerobot-dataset-viz \
+    --repo-id zhang/0209_pick_doll_place \
+    --episode-index 0 \
+    --display-compressed-images False \
+    --video-backend pyav \
+    --num-workers 0
