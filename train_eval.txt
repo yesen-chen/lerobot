@@ -1,0 +1,69 @@
+模型训练：
+
+lerobot-train \
+    --dataset.repo_id=zhang/0209_pick_doll_place \
+    --policy.type=diffusion \
+    --steps=100000 \
+    --batch_size=64 \
+    --eval_freq=5000 \
+    --save_freq=10000 \
+    --policy.device=cuda \
+    --policy.use_amp=true \
+    --policy.push_to_hub=false \
+    --wandb.enable=true \
+    --wandb.project=pick_doll_place \
+    --dataset.image_transforms.enable=false \
+    --dataset.image_transforms.center_crop_to_square=true \
+    --dataset.image_transforms.resize_to=120
+
+
+
+
+lerobot-train \
+    --dataset.repo_id=zhang/0209_pick_doll_place \
+    --policy.type=flow_matching \
+    --steps=100000 \
+    --batch_size=64 \
+    --eval_freq=5000 \
+    --save_freq=10000 \
+    --policy.device=cuda \
+    --policy.use_amp=true \
+    --wandb.enable=true \
+    --wandb.project=pick_doll_place_fm \
+    --policy.push_to_hub=false \
+    --dataset.image_transforms.enable=false \
+    --dataset.image_transforms.center_crop_to_square=true \
+    --dataset.image_transforms.resize_to=120
+
+
+lerobot-train \
+    --dataset.repo_id=lerobot/aloha_sim_transfer_cube_human \
+    --policy.type=flow_matching \
+    --steps=100000 \
+    --batch_size=64 \
+    --eval_freq=5000 \
+    --save_freq=10000 \
+    --policy.device=cuda \
+    --policy.use_amp=true \
+    --wandb.enable=true \
+    --wandb.project=aloha_fm \
+    --policy.push_to_hub=false \
+    --dataset.image_transforms.enable=false \
+    --dataset.image_transforms.center_crop_to_square=true \
+    --dataset.image_transforms.resize_to=120
+    --env.type=aloha \
+    --env.task=AlohaTransferCube-v0
+
+
+模型评估
+
+lerobot-record \
+    --robot.type=so101_follower \
+    --robot.port=/dev/ttyACM0 \
+    --robot.id=my_follower_arm \
+    --robot.cameras='{front: {type: opencv, index_or_path: "/dev/video2", width: 640, height: 480, fps: 30}, wrist: {type: opencv, index_or_path: "/dev/video0", width: 640, height: 480, fps: 30}}' \
+    --policy.path=outputs/train/2026-02-09/23-40-17_diffusion/checkpoints/010000/pretrained_model \
+    --dataset.repo_id=zhang/0209_pick_doll_place_eval \
+    --dataset.num_episodes=1 \
+    --dataset.single_task="pick_doll_place" \
+    --display_data=true

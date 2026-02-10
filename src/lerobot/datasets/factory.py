@@ -80,9 +80,12 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
     Returns:
         LeRobotDataset | MultiLeRobotDataset
     """
-    image_transforms = (
-        ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
-    )
+    # Create image transforms if any transformation is needed:
+    # - enable=true: apply augmentation transforms
+    # - center_crop_to_square or resize_to: apply preprocessing even if enable=false
+    tf_cfg = cfg.dataset.image_transforms
+    needs_transforms = tf_cfg.enable or tf_cfg.center_crop_to_square or tf_cfg.resize_to is not None
+    image_transforms = ImageTransforms(tf_cfg) if needs_transforms else None
 
     if isinstance(cfg.dataset.repo_id, str):
         ds_meta = LeRobotDatasetMetadata(

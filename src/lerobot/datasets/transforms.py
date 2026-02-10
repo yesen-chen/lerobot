@@ -179,6 +179,11 @@ class ImageTransformsConfig:
     # By default, transforms are applied in Torchvision's suggested order (shown below).
     # Set this to True to apply them in a random order.
     random_order: bool = False
+    # Preprocessing steps applied before augmentation transforms
+    # Center crop to square before resizing (useful for rectangular images like 640x480 -> 480x480)
+    center_crop_to_square: bool = False
+    # Resize to this size after center cropping (e.g., 120 for 120x120)
+    resize_to: int | None = None
     tfs: dict[str, ImageTransformConfig] = field(
         default_factory=lambda: {
             "brightness": ImageTransformConfig(
@@ -257,4 +262,27 @@ class ImageTransforms(Transform):
             )
 
     def forward(self, *inputs: Any) -> Any:
+        # Apply preprocessing first (center crop to square, then resize)
+        if self._cfg.center_crop_to_square or self._cfg.resize_to is not None:
+            # Get the first input (should be an image)
+            img = inputs[0] if len(inputs) > 0 else inputs
+            if isinstance(img, torch.Tensor):
+                # Apply center crop to square if configured
+                if self._cfg.center_crop_to_square:
+                    # Image shape is [..., C, H, W]
+                    h, w = img.shape[-2:]
+                    crop_size = min(h, w)
+                    img = v2.functional.center_crop(img, [crop_size, crop_size])
+                
+                # Apply resize if configured
+                if self._cfg.resize_to is not None:
+                    img = v2.functional.resize(img, [self._cfg.resize_to, self._cfg.resize_to], antialias=True)
+                
+                # Update inputs
+                if len(inputs) > 1:
+                    inputs = (img,) + inputs[1:]
+                else:
+                    inputs = (img,)
+        
+        # Apply augmentation transforms
         return self.tf(*inputs)

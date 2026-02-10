@@ -1,3 +1,7 @@
+# 串口权限修复（首次需要执行，生效后需重新登录）:
+# sudo usermod -aG dialout $USER
+# sudo chmod 666 /dev/ttyACM*
+
 数据采集：
 
 lerobot-record \
@@ -11,6 +15,7 @@ lerobot-record \
     --dataset.repo_id=zhang/0209_pick_doll_place \
     --dataset.num_episodes=10 \
     --dataset.single_task="pick_doll_place" \
+    --dataset.push_to_hub=false \
     --display_data=true
 
 
@@ -28,7 +33,7 @@ lerobot-record \
     --dataset.repo_id=zhang/0209_pick_doll_place \
     --dataset.num_episodes=10 \
     --dataset.single_task="pick_doll_place" \
-    --display_data=true \
+    --dataset.push_to_hub=false \
     --resume=true \
     --dataset.num_episodes=7
 
