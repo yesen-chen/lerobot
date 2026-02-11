@@ -57,13 +57,18 @@ lerobot-train \
 
 模型评估
 
-lerobot-record \
-    --robot.type=so101_follower \
-    --robot.port=/dev/ttyACM0 \
-    --robot.id=my_follower_arm \
-    --robot.cameras='{front: {type: opencv, index_or_path: "/dev/video2", width: 640, height: 480, fps: 30}, wrist: {type: opencv, index_or_path: "/dev/video0", width: 640, height: 480, fps: 30}}' \
-    --policy.path=outputs/train/2026-02-09/23-40-17_diffusion/checkpoints/010000/pretrained_model \
-    --dataset.repo_id=zhang/0209_pick_doll_place_eval \
-    --dataset.num_episodes=1 \
-    --dataset.single_task="pick_doll_place" \
-    --display_data=true
+python -m src.lerobot.scripts.lerobot_infer  \
+--robot.type=so101_follower \
+--robot.port=/dev/ttyACM0 \
+--robot.id=my_follower_arm \
+"--robot.cameras={front: {type: opencv, index_or_path: /dev/video0, width: 640, height: 480, fps: 30}, wrist: {type: opencv, index_or_path: /dev/video2, width: 640, height: 480, fps: 30}}" \
+--policy.path=/home/zhang/robot/lerobot/outputs/train/2026-02-11/02-45-15_diffusion/checkpoints/050000/pretrained_model \
+--dataset.repo_id=zhang/eval_0211_pick_doll_place \
+--dataset.num_episodes=1 \
+--dataset.single_task=pick_doll_place \
+--display_data=true \
+--dataset.push_to_hub=false \
+--dataset.episode_time_s=100000 \
+--image_transforms.center_crop_to_square=true \
+--image_transforms.resize_to=120 \
+--initial_position="[-5.71, -99.32, 99.64, 75.61, -45.98, 2.03]"

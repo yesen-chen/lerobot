@@ -261,6 +261,125 @@ class ImageCropResizeProcessorStep(ObservationProcessorStep):
         return features
 
 
+@ProcessorStepRegistry.register("inference_image_transform_processor")
+@dataclass
+class InferenceImageTransformProcessorStep(ObservationProcessorStep):
+    """
+    Applies inference-time image transformations to match training preprocessing.
+
+    This step applies center crop to square and/or resize operations to image observations,
+    matching the preprocessing done during training with ImageTransformsConfig.
+
+    Attributes:
+        center_crop_to_square: If True, center crops images to square aspect ratio.
+        resize_to: Target size for resizing (will resize to [resize_to, resize_to]).
+    """
+
+    center_crop_to_square: bool = False
+    resize_to: int | None = None
+
+    def observation(self, observation: dict) -> dict:
+        """
+        Applies center crop and resize to all images in the observation dictionary.
+
+        Args:
+            observation: The observation dictionary, potentially containing image tensors.
+
+        Returns:
+            A new observation dictionary with transformed images.
+        """
+        if not self.center_crop_to_square and self.resize_to is None:
+            return observation
+
+        new_observation = dict(observation)
+
+        # Process all image keys in the observation
+        processed_count = 0
+        for key in observation:
+            if "image" not in key:
+                continue
+
+            image = observation[key]
+            original_shape = image.shape
+            device = image.device
+
+            # NOTE: No mps kernel for crop and resize, so we need to move to cpu
+            if device.type == "mps":
+                image = image.cpu()
+
+            # Center crop to square if configured
+            if self.center_crop_to_square:
+                # Image shape is [..., C, H, W]
+                h, w = image.shape[-2:]
+                crop_size = min(h, w)
+                # Calculate center crop coordinates
+                top = (h - crop_size) // 2
+                left = (w - crop_size) // 2
+                image = F.crop(image, top, left, crop_size, crop_size)
+
+            # Resize if configured
+            if self.resize_to is not None:
+                image = F.resize(image, [self.resize_to, self.resize_to], antialias=True)
+                image = image.clamp(0.0, 1.0)
+
+            new_observation[key] = image.to(device)
+            processed_count += 1
+
+            # Log only once per key to avoid spam
+            if not hasattr(self, '_logged_keys'):
+                self._logged_keys = set()
+            if key not in self._logged_keys:
+                import logging
+                logging.info(
+                    f"InferenceImageTransformProcessorStep: {key} transformed from {original_shape} to {image.shape}"
+                )
+                self._logged_keys.add(key)
+
+        return new_observation
+
+    def get_config(self) -> dict[str, Any]:
+        """
+        Returns the configuration of the step for serialization.
+
+        Returns:
+            A dictionary with the center crop and resize settings.
+        """
+        return {
+            "center_crop_to_square": self.center_crop_to_square,
+            "resize_to": self.resize_to,
+        }
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        """
+        Updates the image feature shapes in the policy features dictionary.
+
+        Args:
+            features: The policy features dictionary.
+
+        Returns:
+            The updated policy features dictionary with new image shapes.
+        """
+        if self.resize_to is None and not self.center_crop_to_square:
+            return features
+
+        for key in features.get(PipelineFeatureType.OBSERVATION, {}):
+            if "image" in key:
+                nb_channel = features[PipelineFeatureType.OBSERVATION][key].shape[0]
+                if self.resize_to is not None:
+                    new_size = (nb_channel, self.resize_to, self.resize_to)
+                else:
+                    # If only center crop, we need the original dimensions
+                    # This is a simplification - actual size depends on input
+                    new_size = features[PipelineFeatureType.OBSERVATION][key].shape
+                features[PipelineFeatureType.OBSERVATION][key] = PolicyFeature(
+                    type=features[PipelineFeatureType.OBSERVATION][key].type,
+                    shape=new_size,
+                )
+        return features
+
+
 @dataclass
 @ProcessorStepRegistry.register("time_limit_processor")
 class TimeLimitProcessorStep(TruncatedProcessorStep):

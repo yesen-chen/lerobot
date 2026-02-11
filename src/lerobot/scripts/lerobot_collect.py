@@ -87,7 +87,6 @@ from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import make_robot_action
 from lerobot.processor import (
-    InferenceImageTransformProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
     RobotAction,
@@ -143,109 +142,6 @@ from lerobot.utils.utils import (
 )
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
-import numpy as np
-
-
-def parse_initial_position(position_str: str | None) -> list[float] | None:
-    """Parse initial position string to list of floats."""
-    if position_str is None:
-        return None
-    
-    # Remove brackets and split by comma
-    position_str = position_str.strip()
-    if position_str.startswith("["):
-        position_str = position_str[1:]
-    if position_str.endswith("]"):
-        position_str = position_str[:-1]
-    
-    try:
-        positions = [float(x.strip()) for x in position_str.split(",")]
-        return positions
-    except ValueError as e:
-        logging.error(f"Failed to parse initial position: {e}")
-        return None
-
-
-def move_to_initial_position(
-    robot: Robot,
-    target_position: list[float],
-    duration_s: float = 3.0,
-    fps: int = 30,
-):
-    """
-    Smoothly move the robot to the target position.
-    
-    Args:
-        robot: The robot instance
-        target_position: List of target joint positions
-        duration_s: Time to complete the movement
-        fps: Control frequency
-    """
-    logging.info(f"Moving to initial position: {target_position}")
-    
-    # Get current position
-    obs = robot.get_observation()
-    
-    # Get motor names from robot action features
-    if hasattr(robot, 'action_features'):
-        motor_names = list(robot.action_features.keys())
-    else:
-        # Fallback: find all .pos keys in observation
-        motor_names = sorted([k for k in obs if '.pos' in k])
-    
-    if not motor_names:
-        logging.warning("Could not find motor names, skipping move to initial position")
-        return
-    
-    # Build current position from individual motor readings
-    current_position = []
-    for name in motor_names:
-        # The observation key might be the same as action key
-        if name in obs:
-            current_position.append(float(obs[name]))
-        else:
-            logging.warning(f"Motor {name} not found in observation")
-            return
-    
-    current_position = np.array(current_position)
-    target_position_arr = np.array(target_position)
-    
-    if len(current_position) != len(target_position_arr):
-        logging.error(
-            f"Position dimension mismatch: current has {len(current_position)} joints, "
-            f"target has {len(target_position_arr)} joints. "
-            f"Motor names: {motor_names}"
-        )
-        return
-    
-    logging.info(f"Motor names: {motor_names}")
-    logging.info(f"Current position: {current_position}")
-    logging.info(f"Target position: {target_position_arr}")
-    
-    # Calculate number of steps
-    num_steps = int(duration_s * fps)
-    
-    # Interpolate positions
-    for step in range(num_steps):
-        t = (step + 1) / num_steps  # Progress from 0 to 1
-        # Use smooth interpolation (ease in/out)
-        t_smooth = 0.5 * (1 - np.cos(np.pi * t))
-        
-        interpolated_position = current_position + t_smooth * (target_position_arr - current_position)
-        
-        # Create action dict
-        action = {}
-        for i, name in enumerate(motor_names):
-            action[name] = float(interpolated_position[i])
-        
-        # Send action
-        robot.send_action(action)
-        
-        # Sleep to maintain FPS
-        precise_sleep(1.0 / fps)
-    
-    logging.info("Reached initial position")
-
 
 @dataclass
 class DatasetRecordConfig:
@@ -295,15 +191,6 @@ class DatasetRecordConfig:
 
 
 @dataclass
-class InferenceImageTransformConfig:
-    """Configuration for inference-time image transforms to match training preprocessing."""
-    # Center crop images to square before resizing (useful for rectangular images like 640x480 -> 480x480)
-    center_crop_to_square: bool = False
-    # Resize to this size after center cropping (e.g., 120 for 120x120)
-    resize_to: int | None = None
-
-
-@dataclass
 class RecordConfig:
     robot: RobotConfig
     dataset: DatasetRecordConfig
@@ -311,13 +198,6 @@ class RecordConfig:
     teleop: TeleoperatorConfig | None = None
     # Whether to control the robot with a policy
     policy: PreTrainedConfig | None = None
-    # Image transforms for inference (to match training preprocessing)
-    image_transforms: InferenceImageTransformConfig = field(default_factory=InferenceImageTransformConfig)
-    # Initial position for the robot before starting (list of joint positions as string)
-    # Example: "[-5.71, -99.32, 99.64, 75.61, -45.98, 2.03]"
-    initial_position: str | None = None
-    # Time in seconds to move to initial position
-    move_to_initial_time_s: float = 3.0
     # Display all cameras on screen
     display_data: bool = False
     # Display data on a remote Rerun server
@@ -604,51 +484,71 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 },
             )
 
-            # Add inference image transform step if configured
-            logging.info(
-                f"Image transforms config: center_crop_to_square={cfg.image_transforms.center_crop_to_square}, "
-                f"resize_to={cfg.image_transforms.resize_to}"
-            )
-            if cfg.image_transforms.center_crop_to_square or cfg.image_transforms.resize_to is not None:
-                image_transform_step = InferenceImageTransformProcessorStep(
-                    center_crop_to_square=cfg.image_transforms.center_crop_to_square,
-                    resize_to=cfg.image_transforms.resize_to,
-                )
-                # Insert image transform step at the beginning of the preprocessor pipeline
-                preprocessor.steps.insert(0, image_transform_step)
-                logging.info(
-                    f"Added inference image transforms step to preprocessor. "
-                    f"Preprocessor now has {len(preprocessor.steps)} steps."
-                )
-            else:
-                logging.warning(
-                    "No image transforms configured! If you trained with center_crop_to_square and resize_to, "
-                    "you should add --image_transforms.center_crop_to_square=true --image_transforms.resize_to=120"
-                )
-
         robot.connect()
         if teleop is not None:
             teleop.connect()
 
         listener, events = init_keyboard_listener()
 
-        # Move to initial position if specified
-        initial_position = parse_initial_position(cfg.initial_position)
-        if initial_position is not None:
-            log_say("Moving to initial position", cfg.play_sounds)
-            move_to_initial_position(
-                robot=robot,
-                target_position=initial_position,
-                duration_s=cfg.move_to_initial_time_s,
-                fps=cfg.dataset.fps,
-            )
-            # Wait a moment for the robot to stabilize
-            time.sleep(0.5)
-            log_say("Ready", cfg.play_sounds)
-
         with VideoEncodingManager(dataset):
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
+                # Allow teleoperation/reset before starting each episode (including the first one)
+                if recorded_episodes == 0:
+                    log_say("Prepare the environment. You can teleoperate the robot. Press Enter when ready to start recording the first episode", cfg.play_sounds)
+                else:
+                    log_say("Reset the environment. You can teleoperate the robot. Press Enter when ready to start recording the next episode", cfg.play_sounds)
+                
+                # reset g1 robot
+                if robot.name == "unitree_g1":
+                    robot.reset()
+                
+                events["start_next_episode"] = False
+                if not is_headless():
+                    print("\n>>> You can teleoperate the robot to prepare the environment <<<")
+                    print(">>> Press ENTER when ready to start recording <<<\n")
+                    # Allow teleoperation while waiting for Enter key
+                    # Run record_loop without dataset to enable teleoperation but not record data
+                    while not events["start_next_episode"] and not events["stop_recording"]:
+                        start_loop_t = time.perf_counter()
+                        
+                        # Get robot observation
+                        obs = robot.get_observation()
+                        obs_processed = robot_observation_processor(obs)
+                        
+                        # Get action from teleop
+                        if teleop is not None:
+                            if isinstance(teleop, Teleoperator):
+                                act = teleop.get_action()
+                                act_processed_teleop = teleop_action_processor((act, obs))
+                            elif isinstance(teleop, list):
+                                teleop_arm = next((t for t in teleop if not isinstance(t, KeyboardTeleop)), None)
+                                teleop_keyboard = next((t for t in teleop if isinstance(t, KeyboardTeleop)), None)
+                                arm_action = teleop_arm.get_action()
+                                arm_action = {f"arm_{k}": v for k, v in arm_action.items()}
+                                keyboard_action = teleop_keyboard.get_action()
+                                base_action = robot._from_keyboard_to_base_action(keyboard_action)
+                                act = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
+                                act_processed_teleop = teleop_action_processor((act, obs))
+                            
+                            robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
+                            robot.send_action(robot_action_to_send)
+                        
+                        if cfg.display_data:
+                            log_rerun_data(
+                                observation=obs_processed, action=act_processed_teleop, compress_images=display_compressed_images
+                            )
+                        
+                        dt_s = time.perf_counter() - start_loop_t
+                        precise_sleep(max(1 / cfg.dataset.fps - dt_s, 0.0))
+                else:
+                    # In headless mode, wait for reset_time_s before starting
+                    print(f"Headless mode: Waiting {cfg.dataset.reset_time_s} seconds before starting episode...")
+                    time.sleep(cfg.dataset.reset_time_s)
+                
+                if events["stop_recording"]:
+                    break
+                
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
                 record_loop(
                     robot=robot,
@@ -667,30 +567,6 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     display_data=cfg.display_data,
                     display_compressed_images=display_compressed_images,
                 )
-
-                # Execute a few seconds without recording to give time to manually reset the environment
-                # Skip reset for the last episode to be recorded
-                if not events["stop_recording"] and (
-                    (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
-                ):
-                    log_say("Reset the environment", cfg.play_sounds)
-
-                    # reset g1 robot
-                    if robot.name == "unitree_g1":
-                        robot.reset()
-
-                    record_loop(
-                        robot=robot,
-                        events=events,
-                        fps=cfg.dataset.fps,
-                        teleop_action_processor=teleop_action_processor,
-                        robot_action_processor=robot_action_processor,
-                        robot_observation_processor=robot_observation_processor,
-                        teleop=teleop,
-                        control_time_s=cfg.dataset.reset_time_s,
-                        single_task=cfg.dataset.single_task,
-                        display_data=cfg.display_data,
-                    )
 
                 if events["rerecord_episode"]:
                     log_say("Re-record episode", cfg.play_sounds)
