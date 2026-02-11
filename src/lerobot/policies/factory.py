@@ -24,9 +24,10 @@ import torch
 from typing_extensions import Unpack
 
 from lerobot.configs.policies import PreTrainedConfig
-from lerobot.configs.types import FeatureType
+from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from lerobot.datasets.utils import dataset_to_policy_features
+from lerobot.utils.constants import OBS_IMAGE
 from lerobot.envs.configs import EnvConfig
 from lerobot.envs.utils import env_to_policy_features
 from lerobot.policies.act.configuration_act import ACTConfig
@@ -438,6 +439,7 @@ def make_policy(
     ds_meta: LeRobotDatasetMetadata | None = None,
     env_cfg: EnvConfig | None = None,
     rename_map: dict[str, str] | None = None,
+    dataset_config: Any = None,
 ) -> PreTrainedPolicy:
     """
     Instantiate a policy model.
@@ -456,6 +458,10 @@ def make_policy(
                  One of `ds_meta` or `env_cfg` must be provided.
         rename_map: Optional mapping of dataset or environment feature keys to match
                  expected policy feature names (e.g., `"left"` → `"camera1"`).
+        dataset_config: Optional dataset config (e.g. from train config). When provided with
+                 image_transforms.resize_to, overrides image feature shapes so the policy is
+                 built for the transformed image size. Required when using resize/center_crop
+                 to avoid SpatialLearnedEmbeddings dimension mismatch.
 
     Returns:
         An instantiated and device-placed policy model.
@@ -500,6 +506,26 @@ def make_policy(
     cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
     if not cfg.input_features:
         cfg.input_features = {key: ft for key, ft in features.items() if key not in cfg.output_features}
+
+    # Override image feature shapes when dataset applies resize/center_crop transforms.
+    # The policy must be built with the *effective* image shape (after transforms), not the
+    # raw dataset meta shape, otherwise SpatialLearnedEmbeddings will have wrong dimensions.
+    if (
+        ds_meta is not None
+        and dataset_config is not None
+        and hasattr(dataset_config, "image_transforms")
+    ):
+        tf_cfg = dataset_config.image_transforms
+        if tf_cfg.resize_to is not None:
+            size = tf_cfg.resize_to
+            for key in list(cfg.input_features):
+                if key.startswith(OBS_IMAGE) and hasattr(cfg.input_features[key], "shape"):
+                    orig_shape = cfg.input_features[key].shape
+                    num_channels = orig_shape[0] if orig_shape else 3
+                    cfg.input_features[key] = PolicyFeature(
+                        type=cfg.input_features[key].type,
+                        shape=(num_channels, size, size),
+                    )
     kwargs["config"] = cfg
 
     # Pass dataset_stats to the policy if available (needed for some policies like SARM)

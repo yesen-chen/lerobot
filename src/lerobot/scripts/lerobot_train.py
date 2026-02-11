@@ -235,6 +235,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         cfg=cfg.policy,
         ds_meta=dataset.meta,
         rename_map=cfg.rename_map,
+        dataset_config=cfg.dataset,
     )
 
     if cfg.peft is not None:
