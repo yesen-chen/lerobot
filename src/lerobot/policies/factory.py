@@ -33,6 +33,7 @@ from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.fm.configuration_fm import FlowMatchingConfig
 from lerobot.policies.groot.configuration_groot import GrootConfig
+from lerobot.policies.mlp.configuration_mlp import MLPConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -68,7 +69,7 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
 
     Args:
         name: The name of the policy. Supported names are "tdmpc", "diffusion", "act",
-              "vqbet", "pi0", "pi05", "sac", "reward_classifier", "smolvla", "wall_x".
+              "vqbet", "pi0", "pi05", "sac", "mlp", "reward_classifier", "smolvla", "wall_x".
 
     Returns:
         The policy class corresponding to the given name.
@@ -112,6 +113,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.sac.modeling_sac import SACPolicy
 
         return SACPolicy
+    elif name == "mlp":
+        from lerobot.policies.mlp.modeling_mlp import MLPPolicy
+
+        return MLPPolicy
     elif name == "reward_classifier":
         from lerobot.policies.sac.reward_model.modeling_classifier import Classifier
 
@@ -152,7 +157,7 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
 
     Args:
         policy_type: The type of the policy. Supported types include "tdmpc",
-                     "diffusion", "act", "vqbet", "pi0", "pi05", "sac", "smolvla",
+                     "diffusion", "act", "vqbet", "pi0", "pi05", "sac", "mlp", "smolvla",
                      "reward_classifier", "wall_x".
         **kwargs: Keyword arguments to be passed to the configuration class constructor.
 
@@ -178,6 +183,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return PI05Config(**kwargs)
     elif policy_type == "sac":
         return SACConfig(**kwargs)
+    elif policy_type == "mlp":
+        return MLPConfig(**kwargs)
     elif policy_type == "smolvla":
         return SmolVLAConfig(**kwargs)
     elif policy_type == "reward_classifier":
@@ -352,6 +359,14 @@ def make_pre_post_processors(
         from lerobot.policies.sac.processor_sac import make_sac_pre_post_processors
 
         processors = make_sac_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, MLPConfig):
+        from lerobot.policies.mlp.processor_mlp import make_mlp_pre_post_processors
+
+        processors = make_mlp_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
