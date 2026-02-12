@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
-from lerobot.optim.optimizers import AdamConfig
+from lerobot.optim.optimizers import AdamWConfig
 from lerobot.optim.schedulers import DiffuserSchedulerConfig
 
 
@@ -92,12 +92,17 @@ class DiffusionConfig(PreTrainedConfig):
         do_mask_loss_for_padding: Whether to mask the loss when there are copy-padded actions. See
             `LeRobotDataset` and `load_previous_and_future_frames` for more information. Note, this defaults
             to False as the original Diffusion Policy implementation does the same.
+        backbone_lr_scale: Learning rate scaling factor for the vision backbone. Useful when using pretrained
+            weights - a value of 0.1 means the backbone learns at 1/10th the learning rate of other params.
+        use_ema: Whether to use Exponential Moving Average (EMA) for training stabilization. The EMA weights
+            can be used during inference for better performance.
+        ema_power: Power parameter for EMA updates. Higher values give more weight to recent parameters.
     """
 
     # Inputs / output structure.
-    n_obs_steps: int = 2
-    horizon: int = 16
-    n_action_steps: int = 8
+    n_obs_steps: int = 1
+    horizon: int = 64
+    n_action_steps: int = 64
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -107,27 +112,31 @@ class DiffusionConfig(PreTrainedConfig):
         }
     )
 
-    # The original implementation doesn't sample frames for the last 7 steps,
+    # The original implementation doesn't sample frames for the last steps,
     # which avoids excessive padding and leads to improved training results.
-    drop_n_last_frames: int = 7  # horizon - n_action_steps - n_obs_steps + 1
+    # horizon - n_action_steps - n_obs_steps + 1; e.g. 64-64-1+1=0 for chunk_size 64
+    drop_n_last_frames: int = 0
 
     # Architecture / modeling.
     # Vision backbone.
     vision_backbone: str = "resnet18"
-    crop_shape: tuple[int, int] | None = (112, 112)
+    #crop_shape: tuple[int, int] | None = (112, 112)
+    crop_shape: tuple[int, int] | None = None
     crop_is_random: bool = True
     pretrained_backbone_weights: str | None = None
     use_group_norm: bool = True
     spatial_softmax_num_keypoints: int = 32
     use_separate_rgb_encoder_per_camera: bool = False
+    # Backbone learning rate scaling - useful when using pretrained weights
+    backbone_lr_scale: float = 1.0
     # Unet.
-    down_dims: tuple[int, ...] = (512, 1024, 2048)
+    down_dims: tuple[int, ...] = (256, 512, 1024)
     kernel_size: int = 5
     n_groups: int = 8
-    diffusion_step_embed_dim: int = 128
+    diffusion_step_embed_dim: int = 256
     use_film_scale_modulation: bool = True
     # Noise scheduler.
-    noise_scheduler_type: str = "DDPM"
+    noise_scheduler_type: str = "DDIM"
     num_train_timesteps: int = 100
     beta_schedule: str = "squaredcos_cap_v2"
     beta_start: float = 0.0001
@@ -137,16 +146,20 @@ class DiffusionConfig(PreTrainedConfig):
     clip_sample_range: float = 1.0
 
     # Inference
-    num_inference_steps: int | None = None
+    num_inference_steps: int | None = 10
 
     # Loss computation
     do_mask_loss_for_padding: bool = False
 
+    # EMA (Exponential Moving Average) for training stabilization
+    use_ema: bool = True
+    ema_power: float = 0.75
+
     # Training presets
-    optimizer_lr: float = 1e-4
+    optimizer_lr: float = 3e-4
     optimizer_betas: tuple = (0.95, 0.999)
     optimizer_eps: float = 1e-8
-    optimizer_weight_decay: float = 1e-6
+    optimizer_weight_decay: float = 1e-4
     scheduler_name: str = "cosine"
     scheduler_warmup_steps: int = 500
 
@@ -180,8 +193,8 @@ class DiffusionConfig(PreTrainedConfig):
                 f"by `len(down_dims)`). Got {self.horizon=} and {self.down_dims=}"
             )
 
-    def get_optimizer_preset(self) -> AdamConfig:
-        return AdamConfig(
+    def get_optimizer_preset(self) -> AdamWConfig:
+        return AdamWConfig(
             lr=self.optimizer_lr,
             betas=self.optimizer_betas,
             eps=self.optimizer_eps,

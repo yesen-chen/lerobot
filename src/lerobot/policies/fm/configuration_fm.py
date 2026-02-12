@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
-from lerobot.optim.optimizers import AdamConfig
+from lerobot.optim.optimizers import AdamWConfig
 from lerobot.optim.schedulers import DiffuserSchedulerConfig
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
 
@@ -67,13 +67,20 @@ class FlowMatchingConfig(PreTrainedConfig):
         ode_atol: Absolute tolerance for ODE solver (only used when solver_type="dopri5").
         ode_rtol: Relative tolerance for ODE solver (only used when solver_type="dopri5").
         do_mask_loss_for_padding: Whether to mask loss for padded actions.
+        clip_sample: Whether to clip the output actions to [-clip_sample_range, +clip_sample_range].
+            This prevents unstable physics simulations from extreme action values.
+        clip_sample_range: The magnitude of the clipping range for output actions.
+        backbone_lr_scale: Learning rate scaling factor for the vision backbone. Useful when using pretrained
+            weights - a value of 0.1 means the backbone learns at 1/10th the learning rate of other params.
+        use_ema: Whether to use Exponential Moving Average (EMA) for training stabilization.
+        ema_power: Power parameter for EMA updates. Higher values give more weight to recent parameters.
         rtc_config: Real-Time Chunking configuration. None to disable RTC.
     """
 
     # Inputs / output structure.
-    n_obs_steps: int = 2
-    horizon: int = 16
-    n_action_steps: int = 8
+    n_obs_steps: int = 1
+    horizon: int = 64
+    n_action_steps: int = 64
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -83,44 +90,53 @@ class FlowMatchingConfig(PreTrainedConfig):
         }
     )
 
-    # The original implementation doesn't sample frames for the last 7 steps,
-    # which avoids excessive padding and leads to improved training results.
-    drop_n_last_frames: int = 7  # horizon - n_action_steps - n_obs_steps + 1
+    # The original implementation doesn't sample frames for the last steps.
+    # horizon - n_action_steps - n_obs_steps + 1; e.g. 64-64-1+1=0 for chunk_size 64
+    drop_n_last_frames: int = 0
 
     # Architecture / modeling.
     # Vision backbone.
     vision_backbone: str = "resnet18"
-    crop_shape: tuple[int, int] | None = (112, 112)
+    #crop_shape: tuple[int, int] | None = (112, 112)
+    crop_shape: tuple[int, int] | None = None
     crop_is_random: bool = True
     pretrained_backbone_weights: str | None = None
     use_group_norm: bool = True
     spatial_softmax_num_keypoints: int = 32
     use_separate_rgb_encoder_per_camera: bool = False
+    # Backbone learning rate scaling - useful when using pretrained weights
+    backbone_lr_scale: float = 1.0
 
     # UNet (velocity prediction network).
-    down_dims: tuple[int, ...] = (512, 1024, 2048)
+    down_dims: tuple[int, ...] = (256, 512, 1024)
     kernel_size: int = 5
     n_groups: int = 8
-    time_embed_dim: int = 128
+    time_embed_dim: int = 256
     use_film_scale_modulation: bool = True
 
     # Flow Matching parameters.
-    num_inference_steps: int = 10  # ILStudio default: 100 steps for Euler
+    num_inference_steps: int = 10
     solver_type: str = "euler"  # "euler" or "dopri5"
     ode_atol: float = 1e-5  # ODE solver absolute tolerance
     ode_rtol: float = 1e-5  # ODE solver relative tolerance
+    clip_sample: bool = True  # Whether to clip output to [-clip_sample_range, clip_sample_range]
+    clip_sample_range: float = 1.0  # Clipping range for output actions
 
     # Loss computation.
     do_mask_loss_for_padding: bool = False
+
+    # EMA (Exponential Moving Average) for training stabilization
+    use_ema: bool = True
+    ema_power: float = 0.75
 
     # Real-Time Chunking (RTC) configuration.
     rtc_config: RTCConfig | None = None
 
     # Training presets.
-    optimizer_lr: float = 1e-4
+    optimizer_lr: float = 3e-4
     optimizer_betas: tuple = (0.95, 0.999)
     optimizer_eps: float = 1e-8
-    optimizer_weight_decay: float = 1e-6
+    optimizer_weight_decay: float = 1e-4
     scheduler_name: str = "cosine"
     scheduler_warmup_steps: int = 500
 
@@ -155,8 +171,8 @@ class FlowMatchingConfig(PreTrainedConfig):
                 f"by `len(down_dims)`). Got {self.horizon=} and {self.down_dims=}"
             )
 
-    def get_optimizer_preset(self) -> AdamConfig:
-        return AdamConfig(
+    def get_optimizer_preset(self) -> AdamWConfig:
+        return AdamWConfig(
             lr=self.optimizer_lr,
             betas=self.optimizer_betas,
             eps=self.optimizer_eps,

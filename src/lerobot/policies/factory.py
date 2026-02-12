@@ -518,13 +518,22 @@ def make_policy(
         tf_cfg = dataset_config.image_transforms
         if tf_cfg.resize_to is not None:
             size = tf_cfg.resize_to
+            if isinstance(size, int):
+                height, width = size, size
+            elif isinstance(size, (tuple, list)) and len(size) == 2:
+                height, width = int(size[0]), int(size[1])
+            else:
+                raise ValueError(
+                    "`image_transforms.resize_to` must be an int or a tuple/list of (H, W). "
+                    f"Got {size!r}."
+                )
             for key in list(cfg.input_features):
                 if key.startswith(OBS_IMAGE) and hasattr(cfg.input_features[key], "shape"):
                     orig_shape = cfg.input_features[key].shape
                     num_channels = orig_shape[0] if orig_shape else 3
                     cfg.input_features[key] = PolicyFeature(
                         type=cfg.input_features[key].type,
-                        shape=(num_channels, size, size),
+                        shape=(num_channels, height, width),
                     )
     kwargs["config"] = cfg
 

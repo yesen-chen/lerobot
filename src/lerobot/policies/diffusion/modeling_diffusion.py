@@ -31,6 +31,7 @@ import torch.nn.functional as F  # noqa: N812
 import torchvision
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+from diffusers.training_utils import EMAModel
 from torch import Tensor, nn
 
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
@@ -74,9 +75,34 @@ class DiffusionPolicy(PreTrainedPolicy):
 
         self.diffusion = DiffusionModel(config)
 
+        # Initialize EMA if enabled
+        self.ema = None
+        self._ema_device_set = False
+        if config.use_ema:
+            self.ema = EMAModel(
+                self.diffusion.parameters(),
+                power=config.ema_power,
+            )
+
         self.reset()
 
     def get_optim_params(self) -> dict:
+        """Return optimizer parameter groups with optional backbone learning rate scaling."""
+        if self.config.backbone_lr_scale != 1.0 and self.config.image_features:
+            # Separate backbone and non-backbone parameters
+            backbone_params = []
+            other_params = []
+            for name, param in self.diffusion.named_parameters():
+                if "backbone" in name:
+                    backbone_params.append(param)
+                else:
+                    other_params.append(param)
+            # Calculate actual backbone LR from base LR and scale factor
+            backbone_lr = self.config.optimizer_lr * self.config.backbone_lr_scale
+            return [
+                {"params": other_params},
+                {"params": backbone_params, "lr": backbone_lr},
+            ]
         return self.diffusion.parameters()
 
     def reset(self):
@@ -127,7 +153,20 @@ class DiffusionPolicy(PreTrainedPolicy):
 
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+            # Get the first image to determine the shape
+            first_key = next(iter(self.config.image_features))
+            first_img = batch[first_key]
+
+            # For inference, images typically come as (C, H, W) or (1, C, H, W)
+            # We need to ensure they have the right shape for stacking
+            if first_img.dim() == 3:
+                # Add batch dimension: (C, H, W) -> (1, C, H, W)
+                images = [batch[key].unsqueeze(0) for key in self.config.image_features]
+            else:
+                images = [batch[key] for key in self.config.image_features]
+
+            # Stack cameras: shape becomes (..., n_cameras, C, H, W)
+            batch[OBS_IMAGES] = torch.stack(images, dim=-4)
         # NOTE: It's important that this happens after stacking the images into a single key.
         self._queues = populate_queues(self._queues, batch)
 
@@ -138,14 +177,49 @@ class DiffusionPolicy(PreTrainedPolicy):
         action = self._queues[ACTION].popleft()
         return action
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
+    def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, None]:
         """Run the batch through the model and compute the loss for training or validation."""
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
-        loss = self.diffusion.compute_loss(batch)
+            # Get the first image to determine the shape
+            first_key = next(iter(self.config.image_features))
+            first_img = batch[first_key]
+
+            # Expected shape is (B, n_obs_steps, C, H, W) = 5D
+            # If 4D (B, C, H, W), add the n_obs_steps dimension
+            if first_img.dim() == 4:
+                images = [batch[key].unsqueeze(1) for key in self.config.image_features]
+            else:
+                images = [batch[key] for key in self.config.image_features]
+
+            # Stack cameras at dim 2: (B, n_obs_steps, n_cameras, C, H, W)
+            batch[OBS_IMAGES] = torch.stack(images, dim=2)
+        loss = self.diffusion.compute_loss(batch, reduction=reduction)
         # no output_dict so returning None
         return loss, None
+
+    def update(self):
+        """Update EMA parameters after each training step."""
+        if self.ema is not None:
+            # Ensure EMA shadow parameters are on the same device as model parameters (only once)
+            if not self._ema_device_set:
+                device = next(self.diffusion.parameters()).device
+                self.ema.to(device)
+                self._ema_device_set = True
+            self.ema.step(self.diffusion.parameters())
+
+    def use_ema_weights(self):
+        """Switch to EMA weights for inference."""
+        if self.ema is not None:
+            # Store current weights
+            self.ema.store(self.diffusion.parameters())
+            # Copy EMA weights to model
+            self.ema.copy_to(self.diffusion.parameters())
+
+    def restore_training_weights(self):
+        """Restore training weights after inference with EMA."""
+        if self.ema is not None:
+            self.ema.restore(self.diffusion.parameters())
 
 
 def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMScheduler:
@@ -300,7 +374,7 @@ class DiffusionModel(nn.Module):
 
         return actions
 
-    def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
+    def compute_loss(self, batch: dict[str, Tensor], reduction: str = "mean") -> Tensor:
         """
         This function expects `batch` to have (at least):
         {
@@ -313,6 +387,10 @@ class DiffusionModel(nn.Module):
             "action": (B, horizon, action_dim)
             "action_is_pad": (B, horizon)
         }
+
+        Args:
+            batch: Input batch dictionary.
+            reduction: Loss reduction method - "mean" for standard training, "none" for per-sample loss.
         """
         # Input validation.
         assert set(batch).issuperset({OBS_STATE, ACTION, "action_is_pad"})
@@ -363,6 +441,9 @@ class DiffusionModel(nn.Module):
             in_episode_bound = ~batch["action_is_pad"]
             loss = loss * in_episode_bound.unsqueeze(-1)
 
+        if reduction == "none":
+            # Return per-sample loss (mean over action dimensions and horizon)
+            return loss.mean(dim=(1, 2))
         return loss.mean()
 
 
@@ -762,3 +843,122 @@ class DiffusionConditionalResidualBlock1d(nn.Module):
         out = self.conv2(out)
         out = out + self.residual_conv(x)
         return out
+
+
+# ==============================================================================
+# Test: Verify backbone_lr_scale is correctly applied
+# ==============================================================================
+
+if __name__ == "__main__":
+    import torch
+    from lerobot.configs.types import FeatureType, PolicyFeature
+    from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+    
+    print("=" * 70)
+    print("Testing backbone_lr_scale parameter group configuration")
+    print("=" * 70)
+    
+    # Create a config with image features and backbone_lr_scale
+    state_dim = 14
+    action_dim = 14
+    
+    input_features = {
+        "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(state_dim,)),
+        "observation.images.top": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 480, 640)),
+    }
+    output_features = {
+        "action": PolicyFeature(type=FeatureType.ACTION, shape=(action_dim,)),
+    }
+    
+    # Test 1: backbone_lr_scale = 0.1
+    print("\n[Test 1] backbone_lr_scale = 0.1")
+    config = DiffusionConfig(
+        input_features=input_features,
+        output_features=output_features,
+        backbone_lr_scale=0.1,
+        optimizer_lr=3e-4,
+    )
+    
+    policy = DiffusionPolicy(config)
+    optim_params = policy.get_optim_params()
+    
+    print(f"  config.optimizer_lr = {config.optimizer_lr}")
+    print(f"  config.backbone_lr_scale = {config.backbone_lr_scale}")
+    print(f"  Expected backbone_lr = {config.optimizer_lr * config.backbone_lr_scale}")
+    
+    if isinstance(optim_params, list):
+        print(f"  Returned {len(optim_params)} parameter groups:")
+        for i, group in enumerate(optim_params):
+            num_params = len(group["params"])
+            lr = group.get("lr", "NOT SET (will use global lr)")
+            lr_scale = group.get("lr_scale", None)
+            print(f"    Group {i}: {num_params} params, lr={lr}", end="")
+            if lr_scale is not None:
+                print(f", lr_scale={lr_scale} (WARNING: lr_scale is NOT recognized by PyTorch!)")
+            else:
+                print()
+        
+        # Check if 'lr' is correctly set
+        backbone_group = optim_params[1]
+        if "lr" in backbone_group:
+            expected_lr = config.optimizer_lr * config.backbone_lr_scale
+            actual_lr = backbone_group["lr"]
+            if abs(actual_lr - expected_lr) < 1e-10:
+                print(f"  ✓ PASS: Backbone lr correctly set to {actual_lr}")
+            else:
+                print(f"  ✗ FAIL: Expected {expected_lr}, got {actual_lr}")
+        else:
+            print(f"  ✗ FAIL: 'lr' not set in backbone group!")
+            if "lr_scale" in backbone_group:
+                print(f"    Found 'lr_scale' instead - this won't work with PyTorch optimizer!")
+    else:
+        print(f"  Returned parameters() generator (backbone_lr_scale=1.0 or no image features)")
+    
+    # Test 2: backbone_lr_scale = 1.0 (should return parameters() directly)
+    print("\n[Test 2] backbone_lr_scale = 1.0 (default)")
+    config2 = DiffusionConfig(
+        input_features=input_features,
+        output_features=output_features,
+        backbone_lr_scale=1.0,
+        optimizer_lr=3e-4,
+    )
+    
+    policy2 = DiffusionPolicy(config2)
+    optim_params2 = policy2.get_optim_params()
+    
+    if isinstance(optim_params2, list):
+        print(f"  Returned list with {len(optim_params2)} groups")
+    else:
+        print(f"  ✓ PASS: Returned parameters() generator (no separate groups needed)")
+    
+    # Test 3: Simulate optimizer creation
+    print("\n[Test 3] Simulating optimizer creation with backbone_lr_scale=0.1")
+    
+    base_lr = 3e-4
+    optimizer = torch.optim.Adam(optim_params, lr=base_lr)
+    
+    print(f"  Base lr passed to optimizer: {base_lr}")
+    print(f"  Number of param groups in optimizer: {len(optimizer.param_groups)}")
+    
+    for i, group in enumerate(optimizer.param_groups):
+        print(f"    Group {i}: lr={group['lr']}, num_params={len(group['params'])}")
+    
+    # Verify
+    if len(optimizer.param_groups) >= 2:
+        group0_lr = optimizer.param_groups[0]["lr"]
+        group1_lr = optimizer.param_groups[1]["lr"]
+        expected_backbone_lr = base_lr * config.backbone_lr_scale
+        
+        print(f"\n  Expected:")
+        print(f"    Group 0 (other params): lr={base_lr}")
+        print(f"    Group 1 (backbone): lr={expected_backbone_lr}")
+        
+        if abs(group1_lr - expected_backbone_lr) < 1e-10:
+            print(f"\n  ✓ SUCCESS: Backbone learning rate is correctly set!")
+        else:
+            print(f"\n  ✗ FAILURE: Backbone lr is {group1_lr}, expected {expected_backbone_lr}")
+            print(f"    This means backbone_lr_scale was NOT working before the fix!")
+    
+    print("\n" + "=" * 70)
+    print("Test completed.")
+    print("=" * 70)

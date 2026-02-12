@@ -182,8 +182,10 @@ class ImageTransformsConfig:
     # Preprocessing steps applied before augmentation transforms
     # Center crop to square before resizing (useful for rectangular images like 640x480 -> 480x480)
     center_crop_to_square: bool = False
-    # Resize to this size after center cropping (e.g., 120 for 120x120)
-    resize_to: int | None = None
+    # Resize to this size after center cropping. Can be:
+    #   - int: resize to square (e.g., 120 for 120x120)
+    #   - tuple[int, int]: resize to (H, W) (e.g., (120, 160) for 120x160)
+    resize_to: int | tuple[int, int] | None = None
     tfs: dict[str, ImageTransformConfig] = field(
         default_factory=lambda: {
             "brightness": ImageTransformConfig(
@@ -276,7 +278,12 @@ class ImageTransforms(Transform):
                 
                 # Apply resize if configured
                 if self._cfg.resize_to is not None:
-                    img = v2.functional.resize(img, [self._cfg.resize_to, self._cfg.resize_to], antialias=True)
+                    if isinstance(self._cfg.resize_to, int):
+                        resize_size = [self._cfg.resize_to, self._cfg.resize_to]
+                    else:
+                        # tuple[int, int] for (H, W)
+                        resize_size = list(self._cfg.resize_to)
+                    img = v2.functional.resize(img, resize_size, antialias=True)
                 
                 # Update inputs
                 if len(inputs) > 1:

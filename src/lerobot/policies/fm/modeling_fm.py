@@ -23,6 +23,10 @@ Implements Conditional Flow Matching (Lipman et al., 2023) with:
 - Support for both Euler and adaptive ODE (dopri5) solvers
 """
 
+"""
+lerobot-train     --dataset.repo_id=lerobot/aloha_sim_transfer_cube_human     --policy.type=diffusion     --steps=200000     --batch_size=64     --eval_freq=10000     --save_freq=100000 --dataset.image_transforms.enable=false     --policy.device=cuda     --policy.use_amp=true     --wandb.enable=true     --wandb.project=aloha_dp     --policy.push_to_hub=false     --env.type=aloha     --env.task=AlohaTransferCube-v0 --policy.pretrained_backbone_weights=ResNet18_Weights.IMAGENET1K_V1  --policy.use_group_norm=false --policy.backbone_lr_scale=0.1
+"""
+
 import math
 from collections import deque
 from collections.abc import Callable
@@ -33,6 +37,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
 import torchvision
+from diffusers.training_utils import EMAModel
 from torch import Tensor, nn
 from typing_extensions import Unpack
 
@@ -85,9 +90,34 @@ class FlowMatchingPolicy(PreTrainedPolicy):
 
         self.flow_matching = FlowMatchingModel(config)
 
+        # Initialize EMA if enabled
+        self.ema = None
+        self._ema_device_set = False
+        if config.use_ema:
+            self.ema = EMAModel(
+                self.flow_matching.parameters(),
+                power=config.ema_power,
+            )
+
         self.reset()
 
     def get_optim_params(self) -> dict:
+        """Return optimizer parameter groups with optional backbone learning rate scaling."""
+        if self.config.backbone_lr_scale != 1.0 and self.config.image_features:
+            # Separate backbone and non-backbone parameters
+            backbone_params = []
+            other_params = []
+            for name, param in self.flow_matching.named_parameters():
+                if "backbone" in name:
+                    backbone_params.append(param)
+                else:
+                    other_params.append(param)
+            # Calculate actual backbone LR from base LR and scale factor
+            backbone_lr = self.config.optimizer_lr * self.config.backbone_lr_scale
+            return [
+                {"params": other_params},
+                {"params": backbone_params, "lr": backbone_lr},
+            ]
         return self.flow_matching.parameters()
 
     def _rtc_enabled(self) -> bool:
@@ -135,7 +165,11 @@ class FlowMatchingPolicy(PreTrainedPolicy):
 
         if self.config.image_features:
             batch = dict(batch)
-            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+            # At inference, images are (B, C, H, W) = 4D (single timestep)
+            # Stack cameras at dim=1 to get (B, n_cameras, C, H, W) per timestep
+            # The queue will store these, and predict_action_chunk stacks at dim=1 to get
+            # (B, n_obs_steps, n_cameras, C, H, W)
+            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=1)
 
         self._queues = populate_queues(self._queues, batch)
 
@@ -146,13 +180,48 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         action = self._queues[ACTION].popleft()
         return action
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
+    def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, None]:
         """Run the batch through the model and compute the loss for training or validation."""
         if self.config.image_features:
             batch = dict(batch)
-            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
-        loss = self.flow_matching.compute_loss(batch)
+            # Get the first image to determine the shape
+            first_key = next(iter(self.config.image_features))
+            first_img = batch[first_key]
+
+            # Expected shape is (B, n_obs_steps, C, H, W) = 5D
+            # If 4D (B, C, H, W), add the n_obs_steps dimension
+            if first_img.dim() == 4:
+                images = [batch[key].unsqueeze(1) for key in self.config.image_features]
+            else:
+                images = [batch[key] for key in self.config.image_features]
+
+            # Stack cameras at dim 2: (B, n_obs_steps, n_cameras, C, H, W)
+            batch[OBS_IMAGES] = torch.stack(images, dim=2)
+        loss = self.flow_matching.compute_loss(batch, reduction=reduction)
         return loss, None
+
+    def update(self):
+        """Update EMA parameters after each training step."""
+        if self.ema is not None:
+            # Ensure EMA shadow parameters are on the same device as model parameters (only once)
+            if not self._ema_device_set:
+                device = next(self.flow_matching.parameters()).device
+                self.ema.to(device)
+                self._ema_device_set = True
+            self.ema.step(self.flow_matching.parameters())
+
+    def use_ema_weights(self):
+        """Switch to EMA weights for inference."""
+        if self.ema is not None:
+            # Store current weights
+            self.ema.store(self.flow_matching.parameters())
+            # Copy EMA weights to model
+            self.ema.copy_to(self.flow_matching.parameters())
+
+    def restore_training_weights(self):
+        """Restore training weights after inference with EMA."""
+        if self.ema is not None:
+            self.ema.restore(self.flow_matching.parameters())
 
 
 # ==============================================================================
@@ -241,6 +310,10 @@ class FlowMatchingModel(nn.Module):
         start = n_obs_steps - 1
         end = start + self.config.n_action_steps
         actions = actions[:, start:end]
+
+        # Clip actions to prevent physics simulation instabilities
+        if self.config.clip_sample:
+            actions = actions.clamp(-self.config.clip_sample_range, self.config.clip_sample_range)
 
         return actions
 
@@ -379,7 +452,7 @@ class FlowMatchingModel(nn.Module):
     # Training
     # =========================================================================
 
-    def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
+    def compute_loss(self, batch: dict[str, Tensor], reduction: str = "mean") -> Tensor:
         """Compute Flow Matching loss.
 
         Interpolation (PI05-consistent):
@@ -388,6 +461,10 @@ class FlowMatchingModel(nn.Module):
 
         Loss:
             MSE(v_pred, u_t)
+
+        Args:
+            batch: Input batch containing observations and actions.
+            reduction: Loss reduction method. "mean" for average, "none" for per-sample loss.
         """
         assert set(batch).issuperset({OBS_STATE, ACTION, "action_is_pad"})
         assert OBS_IMAGES in batch or OBS_ENV_STATE in batch
@@ -429,7 +506,13 @@ class FlowMatchingModel(nn.Module):
             in_episode_bound = ~batch["action_is_pad"]
             loss = loss * in_episode_bound.unsqueeze(-1)
 
-        return loss.mean()
+        if reduction == "mean":
+            return loss.mean()
+        elif reduction == "none":
+            # Return per-sample loss (B,) by averaging over action dimensions
+            return loss.mean(dim=(1, 2))
+        else:
+            raise ValueError(f"Unsupported reduction: {reduction}")
 
     # =========================================================================
     # Observation encoding (same as Diffusion Policy)
