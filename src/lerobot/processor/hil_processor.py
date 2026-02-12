@@ -272,11 +272,13 @@ class InferenceImageTransformProcessorStep(ObservationProcessorStep):
 
     Attributes:
         center_crop_to_square: If True, center crops images to square aspect ratio.
-        resize_to: Target size for resizing (will resize to [resize_to, resize_to]).
+        resize_to: Target size for resizing. Can be:
+            - int: resize to square [resize_to, resize_to]
+            - tuple[int, int]: resize to (H, W)
     """
 
     center_crop_to_square: bool = False
-    resize_to: int | None = None
+    resize_to: int | tuple[int, int] | None = None
 
     def observation(self, observation: dict) -> dict:
         """
@@ -319,7 +321,11 @@ class InferenceImageTransformProcessorStep(ObservationProcessorStep):
 
             # Resize if configured
             if self.resize_to is not None:
-                image = F.resize(image, [self.resize_to, self.resize_to], antialias=True)
+                if isinstance(self.resize_to, int):
+                    resize_size = [self.resize_to, self.resize_to]
+                else:
+                    resize_size = list(self.resize_to)
+                image = F.resize(image, resize_size, antialias=True)
                 image = image.clamp(0.0, 1.0)
 
             new_observation[key] = image.to(device)
@@ -368,7 +374,10 @@ class InferenceImageTransformProcessorStep(ObservationProcessorStep):
             if "image" in key:
                 nb_channel = features[PipelineFeatureType.OBSERVATION][key].shape[0]
                 if self.resize_to is not None:
-                    new_size = (nb_channel, self.resize_to, self.resize_to)
+                    if isinstance(self.resize_to, int):
+                        new_size = (nb_channel, self.resize_to, self.resize_to)
+                    else:
+                        new_size = (nb_channel, *self.resize_to)
                 else:
                     # If only center crop, we need the original dimensions
                     # This is a simplification - actual size depends on input

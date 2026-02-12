@@ -326,7 +326,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             logging.info(f"{cfg.env.task=}")
             logging.info("Creating environment processors")
             env_preprocessor, env_postprocessor = make_env_pre_post_processors(
-                env_cfg=cfg.env, policy_cfg=cfg.policy
+                env_cfg=cfg.env,
+                policy_cfg=cfg.policy,
+                image_transforms=cfg.dataset.image_transforms,
             )
         logging.info(f"{cfg.steps=} ({format_big_number(cfg.steps)})")
         logging.info(f"{dataset.num_frames=} ({format_big_number(dataset.num_frames)})")

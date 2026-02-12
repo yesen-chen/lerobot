@@ -299,8 +299,11 @@ class InferenceImageTransformConfig:
     """Configuration for inference-time image transforms to match training preprocessing."""
     # Center crop images to square before resizing (useful for rectangular images like 640x480 -> 480x480)
     center_crop_to_square: bool = False
-    # Resize to this size after center cropping (e.g., 120 for 120x120)
-    resize_to: int | None = None
+    # Resize to this size after center cropping.
+    # Can be:
+    #   - int: resize to square (e.g., 120 for 120x120)
+    #   - tuple[int, int]: resize to (H, W) (e.g., (120, 160))
+    resize_to: int | tuple[int, int] | None = None
 
 
 @dataclass

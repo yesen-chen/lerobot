@@ -24,6 +24,7 @@ from lerobot.envs.configs import AlohaEnv, EnvConfig, HubEnvConfig, IsaaclabAren
 from lerobot.envs.utils import _call_make_env, _download_hub_file, _import_hub_module, _normalize_hub_result
 from lerobot.policies.xvla.configuration_xvla import XVLAConfig
 from lerobot.processor import ProcessorStep
+from lerobot.processor.hil_processor import InferenceImageTransformProcessorStep
 from lerobot.processor.env_processor import IsaaclabArenaProcessorStep, LiberoProcessorStep
 from lerobot.processor.pipeline import PolicyProcessorPipeline
 
@@ -42,6 +43,7 @@ def make_env_config(env_type: str, **kwargs) -> EnvConfig:
 def make_env_pre_post_processors(
     env_cfg: EnvConfig,
     policy_cfg: PreTrainedConfig,
+    image_transforms: Any | None = None,
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
@@ -55,6 +57,8 @@ def make_env_pre_post_processors(
 
     Args:
         env_cfg: The configuration of the environment.
+        image_transforms: Optional image transform config (e.g., dataset.image_transforms)
+            used to match training-time preprocessing during evaluation.
 
     Returns:
         A tuple containing:
@@ -68,6 +72,18 @@ def make_env_pre_post_processors(
         from lerobot.policies.xvla.processor_xvla import make_xvla_libero_pre_post_processors
 
         return make_xvla_libero_pre_post_processors()
+
+    # Apply training-time image transforms during eval, if provided.
+    if image_transforms is not None and (
+        getattr(image_transforms, "center_crop_to_square", False)
+        or getattr(image_transforms, "resize_to", None) is not None
+    ):
+        preprocessor_steps.append(
+            InferenceImageTransformProcessorStep(
+                center_crop_to_square=image_transforms.center_crop_to_square,
+                resize_to=image_transforms.resize_to,
+            )
+        )
 
     # For LIBERO environments, add the LiberoProcessorStep to preprocessor
     if isinstance(env_cfg, LiberoEnv) or "libero" in env_cfg.type:

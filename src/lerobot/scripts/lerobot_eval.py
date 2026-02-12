@@ -546,7 +546,9 @@ def eval_main(cfg: EvalPipelineConfig):
     )
 
     # Create environment-specific preprocessor and postprocessor (e.g., for LIBERO environments)
-    env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=cfg.env, policy_cfg=cfg.policy)
+    env_preprocessor, env_postprocessor = make_env_pre_post_processors(
+        env_cfg=cfg.env, policy_cfg=cfg.policy, image_transforms=None
+    )
 
     with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
         info = eval_policy_all(
