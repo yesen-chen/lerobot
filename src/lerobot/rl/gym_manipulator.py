@@ -335,6 +335,8 @@ def make_robot_env(cfg: HILSerlRobotEnvConfig) -> tuple[gym.Env, Any]:
     teleop_device = make_teleoperator_from_config(cfg.teleop)
     teleop_device.connect()
 
+    print(f"teleop_device connected: {teleop_device.is_connected}")
+
     # Create base environment with safe defaults
     use_gripper = cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else True
     display_cameras = (
@@ -469,8 +471,10 @@ def make_processors(
     env_pipeline_steps.append(DeviceProcessorStep(device=device))
 
     action_pipeline_steps = [
-        AddTeleopActionAsComplimentaryDataStep(teleop_device=teleop_device),
+        # Order matters: get_teleop_events before get_action so is_intervention is set
+        # before get_action clears the keyboard state (current_pressed)
         AddTeleopEventsAsInfoStep(teleop_device=teleop_device),
+        AddTeleopActionAsComplimentaryDataStep(teleop_device=teleop_device),
         InterventionActionProcessorStep(
             use_gripper=cfg.processor.gripper.use_gripper if cfg.processor.gripper is not None else False,
             terminate_on_success=terminate_on_success,

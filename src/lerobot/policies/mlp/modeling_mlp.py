@@ -34,13 +34,60 @@ from torch.distributions import Distribution, MultivariateNormal
 
 from lerobot.policies.mlp.configuration_mlp import MLPConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.policies.sac.modeling_sac import (
-    MLP,
-    SACObservationEncoder,
-    TanhMultivariateNormalDiag,
-    orthogonal_init,
-)
-from lerobot.utils.constants import ACTION
+from lerobot.policies.diffusion.modeling_diffusion import DiffusionRgbEncoder
+from lerobot.policies.sac.modeling_sac import MLP, TanhMultivariateNormalDiag, orthogonal_init
+from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_STATE
+
+
+class MLPObservationEncoder(nn.Module):
+    """Diffusion-style observation encoder (ResNet + SpatialSoftmax + concat state/env)."""
+
+    def __init__(self, config: MLPConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.image_keys = list(config.image_features.keys())
+        self.has_images = bool(self.image_keys)
+        self.has_state = config.robot_state_feature is not None
+        self.has_env = config.env_state_feature is not None
+
+        if self.has_images:
+            if config.use_separate_rgb_encoder_per_camera:
+                self.rgb_encoders = nn.ModuleList(
+                    [DiffusionRgbEncoder(config) for _ in range(len(self.image_keys))]
+                )
+                self._image_feature_dim = self.rgb_encoders[0].feature_dim * len(self.image_keys)
+            else:
+                self.rgb_encoder = DiffusionRgbEncoder(config)
+                self._image_feature_dim = self.rgb_encoder.feature_dim * len(self.image_keys)
+        else:
+            self._image_feature_dim = 0
+
+        output_dim = 0
+        if self.has_state:
+            output_dim += config.robot_state_feature.shape[0]
+        if self.has_env:
+            output_dim += config.env_state_feature.shape[0]
+        output_dim += self._image_feature_dim
+        self.output_dim = output_dim
+
+    def forward(self, obs: dict[str, Tensor]) -> Tensor:
+        parts: list[Tensor] = []
+        if self.has_state:
+            parts.append(obs[OBS_STATE])
+        if self.has_env:
+            parts.append(obs[OBS_ENV_STATE])
+        if self.has_images:
+            if self.config.use_separate_rgb_encoder_per_camera:
+                img_features = [
+                    encoder(obs[key]) for encoder, key in zip(self.rgb_encoders, self.image_keys, strict=True)
+                ]
+            else:
+                img_features = [self.rgb_encoder(obs[key]) for key in self.image_keys]
+            parts.append(torch.cat(img_features, dim=-1))
+
+        if not parts:
+            raise ValueError("No observation components found to encode.")
+        return torch.cat(parts, dim=-1)
 
 
 class MLPPolicy(PreTrainedPolicy):
@@ -71,8 +118,8 @@ class MLPPolicy(PreTrainedPolicy):
         # Get action dimension (single step)
         self.action_dim = config.output_features[ACTION].shape[0]
 
-        # Initialize encoder
-        self.encoder = SACObservationEncoder(config)
+        # Initialize diffusion-style encoder
+        self.encoder = MLPObservationEncoder(config)
 
         # Initialize MLP backbone
         # Convert mlp_network_kwargs to dict if it's a dataclass, otherwise use it as is
@@ -133,7 +180,20 @@ class MLPPolicy(PreTrainedPolicy):
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
 
     def get_optim_params(self) -> dict:
-        """Return parameters for optimization."""
+        """Return optimizer parameter groups with optional backbone learning rate scaling."""
+        if self.config.backbone_lr_scale != 1.0 and self.config.image_features:
+            backbone_params = []
+            other_params = []
+            for name, param in self.named_parameters():
+                if "backbone" in name:
+                    backbone_params.append(param)
+                else:
+                    other_params.append(param)
+            backbone_lr = self.config.optimizer_lr * self.config.backbone_lr_scale
+            return [
+                {"params": other_params},
+                {"params": backbone_params, "lr": backbone_lr},
+            ]
         return self.parameters()
 
     @torch.no_grad()
@@ -180,36 +240,59 @@ class MLPPolicy(PreTrainedPolicy):
 
         return actions
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
+    def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
         """Forward pass for training.
 
         Args:
             batch: Dictionary containing observations and actions
+            reduction: Loss reduction method - "mean" for standard training, "none" for per-sample loss.
 
         Returns:
             loss: Total loss
             loss_dict: Dictionary of individual loss components
         """
         if self.config.deterministic:
-            # Deterministic policy: MSE loss
             actions_pred = self._forward_deterministic(batch)
             actions_target = batch[ACTION]  # [batch_size, chunk_size, action_dim]
 
-            # Compute MSE loss
-            loss = F.mse_loss(actions_pred, actions_target)
-            loss_dict = {"mse_loss": loss.item()}
+            # Compute loss (L1 or MSE, configurable)
+            if self.config.loss_type == "l1":
+                loss = F.l1_loss(actions_pred, actions_target, reduction="none")
+            else:
+                loss = F.mse_loss(actions_pred, actions_target, reduction="none")
+
+            # Mask loss wherever the action is padded with copies (edges of dataset trajectory)
+            if self.config.do_mask_loss_for_padding and "action_is_pad" in batch:
+                in_episode_bound = ~batch["action_is_pad"]
+                loss = loss * in_episode_bound.unsqueeze(-1)
+
+            if reduction == "none":
+                loss = loss.mean(dim=(1, 2))  # per-sample loss
+            else:
+                loss = loss.mean()
+
+            loss_dict = {f"{self.config.loss_type}_loss": loss.item()}
         else:
-            # Stochastic policy: use MSE loss on predicted mean
-            # For stochastic policies with tanh squashing, we train by matching the mean predictions
-            # to target actions using MSE loss, which is more stable than NLL with transformed distributions
+            # Stochastic policy: use L1/MSE loss on predicted mean
             actions_pred, log_probs, means = self._forward_stochastic(batch)
             actions_target = batch[ACTION]  # [batch_size, chunk_size, action_dim]
 
-            # Compute MSE loss between predicted means and target actions
-            mse_loss = F.mse_loss(means, actions_target)
+            if self.config.loss_type == "l1":
+                loss = F.l1_loss(means, actions_target, reduction="none")
+            else:
+                loss = F.mse_loss(means, actions_target, reduction="none")
 
-            loss_dict = {"mse_loss": mse_loss.item()}
-            loss = mse_loss
+            # Mask loss wherever the action is padded
+            if self.config.do_mask_loss_for_padding and "action_is_pad" in batch:
+                in_episode_bound = ~batch["action_is_pad"]
+                loss = loss * in_episode_bound.unsqueeze(-1)
+
+            if reduction == "none":
+                loss = loss.mean(dim=(1, 2))
+            else:
+                loss = loss.mean()
+
+            loss_dict = {f"{self.config.loss_type}_loss": loss.item()}
 
         return loss, loss_dict
 

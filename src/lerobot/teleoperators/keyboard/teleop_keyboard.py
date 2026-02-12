@@ -156,6 +156,45 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
         self.config = config
         self.misc_keys_queue = Queue()
 
+    def _on_press_ee(self, key):
+        """Capture all keys including arrows and modifier keys (base class only captures char keys)."""
+        try:
+            self.event_queue.put((key, True))
+        except Exception:
+            logging.exception("Keyboard _on_press_ee error")
+
+    def _on_release_ee(self, key):
+        """Capture all keys including arrows and modifier keys."""
+        try:
+            self.event_queue.put((key, False))
+            # Note: Do NOT disconnect on ESC here - control_loop expects teleop to stay connected.
+            # Use Ctrl+C to exit the program.
+        except Exception:
+            logging.exception("Keyboard _on_release_ee error")
+
+    def _drain_pressed_keys_ee(self):
+        """Drain queue and store key objects (not just char) for arrow/shift/ctrl keys."""
+        while not self.event_queue.empty():
+            key, is_pressed = self.event_queue.get_nowait()
+            if is_pressed:
+                self.current_pressed[key] = True
+            else:
+                self.current_pressed.pop(key, None)
+
+    @check_if_already_connected
+    def connect(self) -> None:
+        """Override to use EE-specific handlers that capture arrow keys and Shift."""
+        if PYNPUT_AVAILABLE:
+            logging.info("pynput is available - enabling local keyboard listener (arrow keys, Shift, Ctrl).")
+            self.listener = keyboard.Listener(
+                on_press=self._on_press_ee,
+                on_release=self._on_release_ee,
+            )
+            self.listener.start()
+        else:
+            logging.info("pynput not available - skipping local keyboard listener.")
+            self.listener = None
+
     @property
     def action_features(self) -> dict:
         if self.config.use_gripper:
@@ -173,7 +212,7 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
 
     @check_if_not_connected
     def get_action(self) -> RobotAction:
-        self._drain_pressed_keys()
+        self._drain_pressed_keys_ee()
         delta_x = 0.0
         delta_y = 0.0
         delta_z = 0.0
@@ -243,6 +282,9 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
                 TeleopEvents.RERECORD_EPISODE: False,
             }
 
+        # Drain key events so current_pressed is up to date (must run before get_action which clears it)
+        self._drain_pressed_keys_ee()
+
         # Check if any movement keys are currently pressed (indicates intervention)
         movement_keys = [
             keyboard.Key.up,
@@ -261,15 +303,16 @@ class KeyboardEndEffectorTeleop(KeyboardTeleop):
         success = False
         rerecord_episode = False
 
-        # Process any pending misc keys
+        # Process any pending misc keys (key can be KeyCode with char or Key enum)
         while not self.misc_keys_queue.empty():
             key = self.misc_keys_queue.get_nowait()
-            if key == "s":
+            key_char = getattr(key, "char", None) if hasattr(key, "char") else None
+            if key_char == "s" or key == "s":
                 success = True
-            elif key == "r":
+            elif key_char == "r" or key == "r":
                 terminate_episode = True
                 rerecord_episode = True
-            elif key == "q":
+            elif key_char == "q" or key == "q":
                 terminate_episode = True
                 success = False
 

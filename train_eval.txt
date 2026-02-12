@@ -5,16 +5,18 @@ lerobot-train \
     --policy.type=diffusion \
     --steps=100000 \
     --batch_size=64 \
-    --eval_freq=5000 \
-    --save_freq=10000 \
+    --eval_freq=10000 \
+    --save_freq=20000 \
+    --dataset.image_transforms.enable=false \
+    --dataset.image_transforms.resize_to=[120,160] \
     --policy.device=cuda \
     --policy.use_amp=true \
     --policy.push_to_hub=false \
+    --policy.pretrained_backbone_weights=ResNet18_Weights.IMAGENET1K_V1 \
+    --policy.use_group_norm=false \
+    --policy.backbone_lr_scale=0.1 \
     --wandb.enable=true \
-    --wandb.project=pick_doll_place \
-    --dataset.image_transforms.enable=false \
-    --dataset.image_transforms.center_crop_to_square=true \
-    --dataset.image_transforms.resize_to=120
+    --wandb.project=pick_doll_place
 
 
 
@@ -24,25 +26,25 @@ lerobot-train \
     --policy.type=flow_matching \
     --steps=100000 \
     --batch_size=256 \
-    --eval_freq=5000 \
+    --eval_freq=10000 \
     --save_freq=20000 \
+    --dataset.image_transforms.enable=false \
+    --dataset.image_transforms.resize_to=[120,160] \
     --policy.device=cuda \
     --policy.use_amp=true \
-    --wandb.enable=true \
-    --wandb.project=pick_doll_place_fm \
     --policy.push_to_hub=false \
-    --dataset.image_transforms.enable=false \
     --policy.pretrained_backbone_weights=ResNet18_Weights.IMAGENET1K_V1 \
     --policy.use_group_norm=false \
     --policy.backbone_lr_scale=0.1 \
-    --dataset.image_transforms.resize_to=[120,160]
+    --wandb.enable=true \
+    --wandb.project=pick_doll_place_fm
 
 
 lerobot-train \
-    --dataset.repo_id=lerobot/aloha_sim_transfer_cube_human \
+    --dataset.repo_id=lerobot/aloha_sim_transfer_cube_scripted \
     --policy.type=diffusion \
     --steps=100000 \
-    --batch_size=256 \
+    --batch_size=64 \
     --eval_freq=10000 \
     --save_freq=20000 \
     --dataset.image_transforms.enable=false \
@@ -59,6 +61,8 @@ lerobot-train \
     --env.task=AlohaTransferCube-v0
 
 
+lerobot-train     --dataset.repo_id=lerobot/aloha_sim_transfer_cube_human     --policy.type=mlp     --policy.chunk_size=50     --policy.n_action_steps=50     --policy.loss_type=l1     --policy.do_mask_loss_for_padding=true     --steps=100000     --batch_size=64     --eval_freq=10000     --save_freq=20000     --dataset.image_transforms.enable=false     --policy.device=cuda     --policy.use_amp=true     --policy.push_to_hub=false     --policy.pretrained_backbone_weights=ResNet18_Weights.IMAGENET1K_V1     --policy.use_group_norm=false     --policy.backbone_lr_scale=0.1     --wandb.enable=true     --wandb.project=aloha_mlp     --env.type=aloha     --env.task=AlohaTransferCube-v0
+
 
 模型评估
 
@@ -74,6 +78,5 @@ python -m src.lerobot.scripts.lerobot_infer  \
 --display_data=true \
 --dataset.push_to_hub=false \
 --dataset.episode_time_s=100000 \
---image_transforms.center_crop_to_square=true \
---image_transforms.resize_to=120 \
+--image_transforms.resize_to=[120,160] \
 --initial_position="[-5.71, -99.32, 99.64, 75.61, -45.98, 2.03]"

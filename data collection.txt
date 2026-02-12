@@ -64,3 +64,8 @@ lerobot-dataset-viz \
     --display-compressed-images False \
     --video-backend pyav \
     --num-workers 0
+
+
+HIL-SERL
+
+python -m lerobot.rl.gym_manipulator --config_path examples/tutorial/rl/real_so101_gym_config.json

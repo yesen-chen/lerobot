@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamWConfig
+from lerobot.optim.schedulers import DiffuserSchedulerConfig
 from lerobot.utils.constants import ACTION, OBS_IMAGE, OBS_STATE
 
 
@@ -39,7 +40,8 @@ def is_image_feature(key: str) -> bool:
 class MLPNetworkConfig:
     """Configuration for MLP network architecture."""
 
-    hidden_dims: list[int] = field(default_factory=lambda: [256, 256])
+    #hidden_dims: list[int] = field(default_factory=lambda: [512, 512, 256])
+    hidden_dims: list[int] = field(default_factory=lambda: [256,256])
     activate_final: bool = True
     dropout_rate: float | None = None
 
@@ -71,8 +73,8 @@ class MLPConfig(PreTrainedConfig):
     """
 
     # Input / output structure
-    chunk_size: int = 16  # Number of actions to predict at once
-    n_action_steps: int = 16  # Number of actions to execute
+    chunk_size: int = 1  # Number of actions to predict at once
+    n_action_steps: int = 1  # Number of actions to execute
 
     # Normalization
     normalization_mapping: dict[str, NormalizationMode] = field(
@@ -87,6 +89,10 @@ class MLPConfig(PreTrainedConfig):
     # Policy type
     deterministic: bool = True  # If False, use stochastic policy with distribution
 
+    # Loss settings
+    loss_type: str = "l1"  # "l1" (robust to mode averaging) or "mse"
+    do_mask_loss_for_padding: bool = True  # Mask padded actions from loss computation
+
     # Stochastic policy parameters
     use_tanh_squash: bool = True
     std_min: float = 1e-5
@@ -98,16 +104,33 @@ class MLPConfig(PreTrainedConfig):
     mlp_network_kwargs: MLPNetworkConfig = field(default_factory=MLPNetworkConfig)
     latent_dim: int = 256
 
-    # Vision encoder settings
+    # Vision encoder settings (DiffusionPolicy-style)
+    vision_backbone: str = "resnet18"
+    crop_shape: tuple[int, int] | None = None
+    crop_is_random: bool = True
+    pretrained_backbone_weights: str | None = None
+    use_group_norm: bool = True
+    spatial_softmax_num_keypoints: int = 32
+    use_separate_rgb_encoder_per_camera: bool = False
+    backbone_lr_scale: float = 1.0
+    # Deprecated (kept for backwards compatibility; no longer used)
     vision_encoder_name: str | None = None
     freeze_vision_encoder: bool = False
     image_encoder_hidden_dim: int = 32
     image_embedding_pooling_dim: int = 8
     shared_encoder: bool = True
 
+    # The original implementation doesn't sample frames for the last steps,
+    # which avoids excessive padding and leads to improved training results.
+    drop_n_last_frames: int = 0
+
     # Training
-    optimizer_lr: float = 1e-4
+    optimizer_lr: float = 3e-4
+    optimizer_betas: tuple[float, float] = (0.95, 0.999)
+    optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 1e-4
+    scheduler_name: str = "cosine"
+    scheduler_warmup_steps: int = 500
 
     def __post_init__(self):
         super().__post_init__()
@@ -119,14 +142,19 @@ class MLPConfig(PreTrainedConfig):
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
             lr=self.optimizer_lr,
+            betas=self.optimizer_betas,
+            eps=self.optimizer_eps,
             weight_decay=self.optimizer_weight_decay,
         )
 
-    def get_scheduler_preset(self) -> None:
-        return None
+    def get_scheduler_preset(self) -> DiffuserSchedulerConfig:
+        return DiffuserSchedulerConfig(
+            name=self.scheduler_name,
+            num_warmup_steps=self.scheduler_warmup_steps,
+        )
 
     def validate_features(self) -> None:
-        """Validate that required features are present."""
+        """Validate that required features are present and image shapes are consistent."""
         has_image = any(is_image_feature(key) for key in self.input_features)
         has_state = OBS_STATE in self.input_features
 
@@ -139,9 +167,27 @@ class MLPConfig(PreTrainedConfig):
         if ACTION not in self.output_features:
             raise ValueError("You must provide 'action' in the output features")
 
+        if self.crop_shape is not None and self.image_features:
+            for key, image_ft in self.image_features.items():
+                if self.crop_shape[0] > image_ft.shape[1] or self.crop_shape[1] > image_ft.shape[2]:
+                    raise ValueError(
+                        f"`crop_shape` should fit within the images shapes. Got {self.crop_shape} "
+                        f"for `crop_shape` and {image_ft.shape} for "
+                        f"`{key}`."
+                    )
+
+        # Check that all input images have the same shape.
+        if self.image_features:
+            first_image_key, first_image_ft = next(iter(self.image_features.items()))
+            for key, image_ft in self.image_features.items():
+                if image_ft.shape != first_image_ft.shape:
+                    raise ValueError(
+                        f"`{key}` does not match `{first_image_key}`, but we expect all image shapes to match."
+                    )
+
     @property
-    def image_features(self) -> list[str]:
-        return [key for key in self.input_features if is_image_feature(key)]
+    def image_features(self) -> dict[str, "PolicyFeature"]:
+        return {key: ft for key, ft in self.input_features.items() if is_image_feature(key)}
 
     @property
     def observation_delta_indices(self) -> list:
