@@ -145,6 +145,142 @@ from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 import numpy as np
 
+from lerobot.configs.train import TRAIN_CONFIG_NAME, TrainPipelineConfig
+from lerobot.datasets.utils import INFO_PATH, STATS_PATH, load_json, load_stats
+from lerobot.utils.constants import HF_LEROBOT_HOME
+
+
+def _get_training_dataset_root(
+    pretrained_path: str | Path,
+    training_dataset_root: str | Path | None = None,
+) -> Path | None:
+    """Get the root directory of the training dataset from policy's train config.
+
+    Only reads config from local disk - no network calls. Uses HF_LEROBOT_HOME cache
+    by default. Pass training_dataset_root to override (e.g. ~/.cache/huggingface/lerobot/zhang/0209_pick_doll_place).
+
+    Returns the training dataset root path if available, else None.
+    """
+    try:
+        path = Path(pretrained_path)
+        if not path.is_dir():
+            return None
+        config_file = path / TRAIN_CONFIG_NAME
+        if not config_file.exists():
+            return None
+        train_cfg = TrainPipelineConfig.from_pretrained(pretrained_path)
+        if train_cfg.dataset is None or not hasattr(train_cfg.dataset, "repo_id"):
+            return None
+        repo_id = (
+            train_cfg.dataset.repo_id[0]
+            if isinstance(train_cfg.dataset.repo_id, list)
+            else train_cfg.dataset.repo_id
+        )
+        # Use local path only - never trigger network download
+        if training_dataset_root is not None:
+            root = Path(training_dataset_root).expanduser()
+        elif train_cfg.dataset.root is not None:
+            root = Path(train_cfg.dataset.root) / repo_id
+        else:
+            root = HF_LEROBOT_HOME / repo_id
+        root = Path(root).expanduser()
+        return root
+    except Exception as e:
+        logging.debug(f"Could not get training dataset root: {e}")
+        return None
+
+
+def _load_training_dataset_features_for_inference(
+    pretrained_path: str | Path,
+    training_dataset_root: str | Path | None = None,
+) -> dict | None:
+    """Load training dataset features from policy's train config for feature alignment validation.
+
+    Only reads meta/info.json from local disk - no network calls. Uses HF_LEROBOT_HOME cache
+    by default. Pass training_dataset_root to override (e.g. ~/.cache/huggingface/lerobot/zhang/0209_pick_doll_place).
+
+    Returns the training dataset's features dict if available, else None.
+    """
+    try:
+        root = _get_training_dataset_root(pretrained_path, training_dataset_root)
+        if root is None:
+            return None
+        info_path = root / INFO_PATH
+        if not info_path.exists():
+            logging.debug(f"Skipping feature validation: {info_path} not found")
+            return None
+        info = load_json(info_path)
+        return info.get("features", {})
+    except Exception as e:
+        logging.debug(f"Could not load training dataset metadata for validation: {e}")
+        return None
+
+
+def _load_training_dataset_stats_for_inference(
+    pretrained_path: str | Path,
+    training_dataset_root: str | Path | None = None,
+) -> dict[str, dict[str, np.ndarray]] | None:
+    """Load training dataset statistics from policy's train config for normalization.
+
+    Only reads meta/stats.json from local disk - no network calls. Uses HF_LEROBOT_HOME cache
+    by default. Pass training_dataset_root to override (e.g. ~/.cache/huggingface/lerobot/zhang/0209_pick_doll_place).
+
+    Returns the training dataset's stats dict if available, else None.
+    """
+    try:
+        root = _get_training_dataset_root(pretrained_path, training_dataset_root)
+        if root is None:
+            return None
+        stats = load_stats(root)
+        return stats
+    except Exception as e:
+        logging.debug(f"Could not load training dataset stats: {e}")
+        return None
+
+
+def _validate_inference_feature_alignment(
+    policy: PreTrainedPolicy,
+    robot_observation_features: dict,
+    training_observation_features: dict,
+) -> None:
+    """Log warnings if robot/inference observation features might not match policy training."""
+    from lerobot.configs.types import FeatureType
+
+    policy_img_keys = [
+        k for k, v in policy.config.input_features.items() if v.type == FeatureType.VISUAL
+    ]
+    policy_state_key = "observation.state"
+
+    # Check image key alignment
+    train_img_keys = [
+        k for k in training_observation_features if "images." in k and "observation" in k
+    ]
+    robot_img_keys = [
+        k for k in robot_observation_features if "images." in k and "observation" in k
+    ]
+
+    if set(policy_img_keys) != set(robot_img_keys):
+        logging.warning(
+            f"Inference feature alignment: Policy expects image keys {sorted(policy_img_keys)}, "
+            f"but robot/dataset provides {sorted(robot_img_keys)}. "
+            "Consider using --dataset.rename_map to align keys if cameras are semantically different."
+        )
+
+    if policy_img_keys and train_img_keys and sorted(policy_img_keys) != sorted(train_img_keys):
+        logging.warning(
+            f"Policy image key order {policy_img_keys} differs from training dataset {train_img_keys}."
+        )
+
+    # Check state (joint) order
+    if policy_state_key in policy.config.input_features and policy_state_key in training_observation_features:
+        train_state_names = training_observation_features[policy_state_key].get("names", [])
+        robot_state_names = robot_observation_features.get(policy_state_key, {}).get("names", [])
+        if train_state_names != robot_state_names:
+            logging.warning(
+                f"Joint/state order mismatch: training had {train_state_names}, "
+                f"robot has {robot_state_names}. This can cause systematic action errors."
+            )
+
 
 def parse_initial_position(position_str: str | None) -> list[float] | None:
     """Parse initial position string to list of floats."""
@@ -314,6 +450,9 @@ class RecordConfig:
     teleop: TeleoperatorConfig | None = None
     # Whether to control the robot with a policy
     policy: PreTrainedConfig | None = None
+    # Local path to training dataset for feature alignment validation (avoids network).
+    # E.g. ~/.cache/huggingface/lerobot/zhang/0209_pick_doll_place
+    policy_training_dataset_root: str | Path | None = None
     # Image transforms for inference (to match training preprocessing)
     image_transforms: InferenceImageTransformConfig = field(default_factory=InferenceImageTransformConfig)
     # Initial position for the robot before starting (list of joint positions as string)
@@ -596,11 +735,45 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)
         preprocessor = None
         postprocessor = None
+
+        # Try to load training dataset metadata for feature alignment validation
+        policy_observation_features = None
+        training_dataset_stats = None
+        if cfg.policy is not None and cfg.policy.pretrained_path:
+            policy_observation_features = _load_training_dataset_features_for_inference(
+                cfg.policy.pretrained_path,
+                training_dataset_root=cfg.policy_training_dataset_root,
+            )
+            if policy_observation_features is not None:
+                logging.info("Running feature alignment validation...")
+                _validate_inference_feature_alignment(
+                    policy=policy,
+                    robot_observation_features=dataset_features,
+                    training_observation_features=policy_observation_features,
+                )
+            
+            # Load training dataset stats for normalization (CRITICAL: must use training stats, not inference dataset stats)
+            training_dataset_stats = _load_training_dataset_stats_for_inference(
+                cfg.policy.pretrained_path,
+                training_dataset_root=cfg.policy_training_dataset_root,
+            )
+            if training_dataset_stats is not None:
+                logging.info("Loaded training dataset stats for normalization")
+            else:
+                logging.warning(
+                    "Could not load training dataset stats. Using inference dataset stats instead. "
+                    "This may cause systematic action errors if the datasets have different distributions. "
+                    "Consider specifying --policy_training_dataset_root to point to the training dataset."
+                )
+
         if cfg.policy is not None:
+            # Use training dataset stats if available, otherwise fall back to inference dataset stats
+            # CRITICAL: Using wrong stats causes systematic action offsets
+            stats_to_use = training_dataset_stats if training_dataset_stats is not None else dataset.meta.stats
             preprocessor, postprocessor = make_pre_post_processors(
                 policy_cfg=cfg.policy,
                 pretrained_path=cfg.policy.pretrained_path,
-                dataset_stats=rename_stats(dataset.meta.stats, cfg.dataset.rename_map),
+                dataset_stats=rename_stats(stats_to_use, cfg.dataset.rename_map),
                 preprocessor_overrides={
                     "device_processor": {"device": cfg.policy.device},
                     "rename_observations_processor": {"rename_map": cfg.dataset.rename_map},

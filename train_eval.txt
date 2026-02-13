@@ -72,6 +72,7 @@ python -m src.lerobot.scripts.lerobot_infer  \
 --robot.id=my_follower_arm \
 "--robot.cameras={front: {type: opencv, index_or_path: /dev/video0, width: 640, height: 480, fps: 30}, wrist: {type: opencv, index_or_path: /dev/video2, width: 640, height: 480, fps: 30}}" \
 --policy.path=/home/zhang/robot/lerobot/outputs/train/2026-02-11/02-45-15_diffusion/checkpoints/050000/pretrained_model \
+--policy.n_action_steps=16 \
 --dataset.repo_id=zhang/eval_0211_pick_doll_place \
 --dataset.num_episodes=1 \
 --dataset.single_task=pick_doll_place \

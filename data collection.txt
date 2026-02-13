@@ -65,6 +65,11 @@ lerobot-dataset-viz \
     --video-backend pyav \
     --num-workers 0
 
+#合并数据集
+python -m lerobot.scripts.lerobot_edit_dataset     --repo_id zhang/pick_doll_place_merged_09_13     --operation.type merge     --operation.repo_ids "['zhang/0209_pick_doll_place', 'zhang/0213_pick_doll_place']"
+
+#hf上传
+hf upload dksen/pick_doll_place_merged_09_13 ~/.cache/huggingface/lerobot/zhang/pick_doll_place_merged_09_13 --repo-type dataset
 
 HIL-SERL
 
