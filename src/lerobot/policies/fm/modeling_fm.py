@@ -52,7 +52,8 @@ from lerobot.policies.utils import (
     populate_queues,
 )
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
-
+import time
+import logging
 
 class ActionSelectKwargs(TypedDict, total=False):
     noise: Tensor | None
@@ -405,6 +406,13 @@ class FlowMatchingModel(nn.Module):
                 v_t = denoise_step_partial(x_t)
 
             x_t = x_t + dt * v_t
+
+            # Clip intermediate values to stay within the training distribution,
+            # matching Diffusion Policy's per-step clipping via clip_sample=True.
+            # Without this, Euler integration errors accumulate and x_t can drift
+            # far outside [-1, 1], causing systematic action bias at inference.
+            if self.config.clip_sample:
+                x_t = x_t.clamp(-self.config.clip_sample_range, self.config.clip_sample_range)
 
             if rtc_processor is not None and rtc_processor.is_debug_enabled():
                 rtc_processor.track(time=time, x_t=x_t, v_t=v_t)

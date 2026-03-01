@@ -64,6 +64,11 @@ lerobot-train \
 lerobot-train     --dataset.repo_id=lerobot/aloha_sim_transfer_cube_human     --policy.type=mlp     --policy.chunk_size=50     --policy.n_action_steps=50     --policy.loss_type=l1     --policy.do_mask_loss_for_padding=true     --steps=100000     --batch_size=64     --eval_freq=10000     --save_freq=20000     --dataset.image_transforms.enable=false     --policy.device=cuda     --policy.use_amp=true     --policy.push_to_hub=false     --policy.pretrained_backbone_weights=ResNet18_Weights.IMAGENET1K_V1     --policy.use_group_norm=false     --policy.backbone_lr_scale=0.1     --wandb.enable=true     --wandb.project=aloha_mlp     --env.type=aloha     --env.task=AlohaTransferCube-v0
 
 
+
+
+lerobot-train --dataset.repo_id=dksen/pick_doll_place_merged_09_13 --dataset.root=E:\cys\dataset\pick_doll_place_merged_09_13 --policy.type=flow_matching --steps=100000 --batch_size=64 --eval_freq=10000 --save_freq=50000 --dataset.image_transforms.enable=false --policy.device=cuda --policy.use_amp=true --policy.push_to_hub=false --policy.pretrained_backbone_weights=ResNet18_Weights.IMAGENET1K_V1 --policy.use_group_norm=false --policy.backbone_lr_scale=0.1 --wandb.enable=false --wandb.project=pick_doll_place --dataset.image_transforms.resize_to=[240,320]
+
+
 模型评估
 
 python -m src.lerobot.scripts.lerobot_infer  \
@@ -81,3 +86,14 @@ python -m src.lerobot.scripts.lerobot_infer  \
 --dataset.episode_time_s=100000 \
 --image_transforms.resize_to=[120,160] \
 --initial_position="[-5.71, -99.32, 99.64, 75.61, -45.98, 2.03]"
+
+
+同步
+
+python -m src.lerobot.scripts.lerobot_infer  --robot.type=so101_follower --robot.port=/dev/ttyACM0 --robot.id=my_follower_arm "--robot.cameras={front: {type: opencv, index_or_path: /dev/video0, width: 640, height: 480, fps: 30}, wrist: {type: opencv, index_or_path: /dev/video2, width: 640, height: 480, fps: 30}}" --dataset.repo_id=zhang/eval_pick_doll_place_merged_09_13 --dataset.num_episodes=1 --dataset.single_task=pick_doll_place --display_data=true --dataset.push_to_hub=false --dataset.episode_time_s=100000 --image_transforms.resize_to=[240,320] --initial_position="[-5.71, -99.32, 99.64, 75.61, -45.98, 2.03]" --policy_training_dataset_root=/home/zhang/.cache/huggingface/lerobot/zhang/pick_doll_place_merged_09_13/ --policy.path=/home/zhang/robot/lerobot/outputs/train/2.14_307/cs64/dp/pretrained_model  --policy.n_action_steps=64
+
+python -m src.lerobot.scripts.lerobot_infer  --robot.type=so101_follower --robot.port=/dev/ttyACM0 --robot.id=my_follower_arm "--robot.cameras={front: {type: opencv, index_or_path: /dev/video0, width: 640, height: 480, fps: 30}, wrist: {type: opencv, index_or_path: /dev/video2, width: 640, height: 480, fps: 30}}" --dataset.repo_id=zhang/eval_pick_doll_place_merged_09_13 --dataset.num_episodes=1 --dataset.single_task=pick_doll_place --display_data=true --dataset.push_to_hub=false --dataset.episode_time_s=100000 --image_transforms.resize_to=[240,320] --initial_position="[-5.71, -99.32, 99.64, 75.61, -45.98, 2.03]" --policy_training_dataset_root=/home/zhang/.cache/huggingface/lerobot/zhang/pick_doll_place_merged_09_13/ --policy.path=/home/zhang/robot/lerobot/outputs/train/2.14_307/cs64/dp/pretrained_model  --policy.n_action_steps=64
+
+异步
+
+python -m src.lerobot.scripts.lerobot_infer_async     --robot.type=so101_follower     --robot.port=/dev/ttyACM0     --robot.id=my_follower_arm     "--robot.cameras={front: {type: opencv, index_or_path: /dev/video0, width: 640, height: 480, fps: 30}, wrist: {type: opencv, index_or_path: /dev/video2, width: 640, height: 480, fps: 30}}"     --dataset.repo_id=zhang/eval_pick_doll_place_merged_09_13     --dataset.num_episodes=1     --dataset.single_task=pick_doll_place     --display_data=true     --dataset.push_to_hub=false     --dataset.episode_time_s=100000     --image_transforms.resize_to=[240,320]     --initial_position="[-5.71, -99.32, 99.64, 75.61, -45.98, 2.03]"     --policy_training_dataset_root=/home/zhang/.cache/huggingface/lerobot/zhang/pick_doll_place_merged_09_13/     --policy.path=/home/zhang/robot/lerobot/outputs/train/2.14_307/cs64/fm/pretrained_model     --policy.n_action_steps=64     --async_cfg.queue_refill_threshold=30 --async_cfg.drop_delay_n_steps=14

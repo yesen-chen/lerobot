@@ -63,6 +63,8 @@ lerobot-record \
 """
 
 import logging
+import shutil
+import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -424,6 +426,8 @@ class DatasetRecordConfig:
     vcodec: str = "libsvtav1"
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
+    # Whether to save rollout data to disk. If False, uses a temp directory and deletes it after.
+    save_rollout: bool = False
 
     def __post_init__(self):
         if self.single_task is None:
@@ -472,6 +476,8 @@ class RecordConfig:
     play_sounds: bool = True
     # Resume recording on an existing dataset.
     resume: bool = False
+    # Log per-loop latency breakdown (observation, action send, total loop).
+    log_latency: bool = False
 
     def __post_init__(self):
         # HACK: We parse again the cli args here to get the pretrained path if there was one.
@@ -545,6 +551,7 @@ def record_loop(
     single_task: str | None = None,
     display_data: bool = False,
     display_compressed_images: bool = False,
+    log_latency: bool = False,
 ):
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
@@ -590,7 +597,9 @@ def record_loop(
             break
 
         # Get robot observation
+        obs_start_t = time.perf_counter()
         obs = robot.get_observation()
+        obs_dt_s = time.perf_counter() - obs_start_t
 
         # Applies a pipeline to the raw robot observation, default is IdentityProcessor
         obs_processed = robot_observation_processor(obs)
@@ -599,6 +608,7 @@ def record_loop(
             observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
 
         # Get action from either policy or teleop
+        action_start_t = time.perf_counter()
         if policy is not None and preprocessor is not None and postprocessor is not None:
             action_values = predict_action(
                 observation=observation_frame,
@@ -633,6 +643,7 @@ def record_loop(
                 "The robot won't be at its rest position at the start of the next episode."
             )
             continue
+        action_dt_s = time.perf_counter() - action_start_t
 
         # Applies a pipeline to the action, default is IdentityProcessor
         if policy is not None and act_processed_policy is not None:
@@ -642,11 +653,24 @@ def record_loop(
             action_values = act_processed_teleop
             robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
 
+        # Compare commanded joint targets against current measured joint positions.
+        # Useful to diagnose "robot not moving" when action deltas become too small.
+        # action_present_abs_diff: dict[str, float] = {}
+        # for key, target in robot_action_to_send.items():
+        #     if key.endswith(".pos") and key in obs:
+        #         try:
+        #             action_present_abs_diff[key] = abs(float(target) - float(obs[key]))
+        #             logging.info(f"{key} {float(target)} {float(obs[key])} {action_present_abs_diff[key]}")
+        #         except (TypeError, ValueError):
+        #             continue
+
         # Send action to robot
         # Action can eventually be clipped using `max_relative_target`,
         # so action actually sent is saved in the dataset. action = postprocessor.process(action)
         # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
+        send_start_t = time.perf_counter()
         _sent_action = robot.send_action(robot_action_to_send)
+        send_dt_s = time.perf_counter() - send_start_t
 
         # Write to dataset
         if dataset is not None:
@@ -660,6 +684,22 @@ def record_loop(
             )
 
         dt_s = time.perf_counter() - start_loop_t
+        if log_latency:
+            logging.info(
+                "latency_s obs=%.4f action=%.4f send=%.4f loop=%.4f",
+                obs_dt_s,
+                action_dt_s,
+                send_dt_s,
+                dt_s,
+            )
+            if action_present_abs_diff:
+                diff_values = list(action_present_abs_diff.values())
+                logging.info(
+                    "action_abs_diff mean=%.4f max=%.4f per_joint=%s",
+                    sum(diff_values) / len(diff_values),
+                    max(diff_values),
+                    action_present_abs_diff,
+                )
         precise_sleep(max(1 / fps - dt_s, 0.0))
 
         timestamp = time.perf_counter() - start_episode_t
@@ -699,6 +739,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
     dataset = None
     listener = None
+    rollout_temp_root: Path | None = None
 
     try:
         if cfg.resume:
@@ -718,10 +759,15 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         else:
             # Create empty dataset or load existing saved episodes
             sanity_check_dataset_name(cfg.dataset.repo_id, cfg.policy)
+            dataset_root = cfg.dataset.root
+            if not cfg.dataset.save_rollout:
+                rollout_temp_root = Path(tempfile.mkdtemp(prefix="lerobot_rollout_"))
+                dataset_root = rollout_temp_root / "dataset"  # subdir so metadata.create can mkdir it
+                logging.info(f"save_rollout=False: using temp directory {rollout_temp_root} (will be deleted after)")
             dataset = LeRobotDataset.create(
                 cfg.dataset.repo_id,
                 cfg.dataset.fps,
-                root=cfg.dataset.root,
+                root=dataset_root,
                 robot_type=robot.name,
                 features=dataset_features,
                 use_videos=cfg.dataset.video,
@@ -842,6 +888,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     single_task=cfg.dataset.single_task,
                     display_data=cfg.display_data,
                     display_compressed_images=display_compressed_images,
+                    log_latency=cfg.log_latency,
                 )
 
                 # Execute a few seconds without recording to give time to manually reset the environment
@@ -866,6 +913,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         control_time_s=cfg.dataset.reset_time_s,
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
+                        log_latency=cfg.log_latency,
                     )
 
                 if events["rerecord_episode"]:
@@ -891,8 +939,12 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         if not is_headless() and listener:
             listener.stop()
 
-        if cfg.dataset.push_to_hub:
+        if cfg.dataset.push_to_hub and cfg.dataset.save_rollout:
             dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
+
+        if rollout_temp_root is not None and rollout_temp_root.exists():
+            logging.info(f"Deleting temp rollout directory: {rollout_temp_root}")
+            shutil.rmtree(rollout_temp_root, ignore_errors=True)
 
         log_say("Exiting", cfg.play_sounds)
     return dataset
