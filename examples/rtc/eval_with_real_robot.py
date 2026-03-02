@@ -15,52 +15,49 @@
 # limitations under the License.
 
 """
-Demo script showing how to use Real-Time Chunking (RTC) with action chunking policies on real robots.
+Async inference script with optional RTC for action chunking policies on real robots.
 
-This script demonstrates:
-1. Creating a robot and policy (SmolVLA, Pi0, etc.) with RTC
-2. Consuming actions from the policy while the robot executes
-3. Periodically requesting new action chunks in the background using threads
-4. Managing action buffers and timing for real-time operation
-
-For simulation environments, see eval_with_simulation.py
+Supports:
+- SmolVLA, Pi0, Pi0.5 (with or without RTC)
+- Flow Matching Policy (with or without RTC)
+- Diffusion Policy (without RTC, async only)
 
 Usage:
-    # Run RTC with Real robot with RTC
-    uv run examples/rtc/eval_with_real_robot.py \
-        --policy.path=helper2424/smolvla_check_rtc_last3 \
-        --policy.device=mps \
+    # Flow Matching with RTC
+    python examples/rtc/eval_with_real_robot.py \
+        --policy.path=/path/to/fm/pretrained_model \
+        --policy.device=cuda \
         --rtc.enabled=true \
         --rtc.execution_horizon=20 \
-        --robot.type=so100_follower \
-        --robot.port=/dev/tty.usbmodem58FA0834591 \
-        --robot.id=so100_follower \
-        --robot.cameras="{ gripper: {type: opencv, index_or_path: 1, width: 640, height: 480, fps: 30}, front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \
-        --task="Move green small object into the purple platform" \
+        --robot.type=so101_follower \
+        --robot.port=/dev/ttyACM0 \
+        --robot.id=my_follower_arm \
+        --robot.cameras="{front: {type: opencv, index_or_path: /dev/video0, width: 640, height: 480, fps: 30}, wrist: {type: opencv, index_or_path: /dev/video2, width: 640, height: 480, fps: 30}}" \
+        --task="pick_doll_place" \
         --duration=120
 
-    # Run RTC with Real robot without RTC
-    uv run examples/rtc/eval_with_real_robot.py \
-        --policy.path=helper2424/smolvla_check_rtc_last3 \
-        --policy.device=mps \
+    # Flow Matching / Diffusion without RTC (pure async)
+    python examples/rtc/eval_with_real_robot.py \
+        --policy.path=/path/to/pretrained_model \
+        --policy.device=cuda \
         --rtc.enabled=false \
-        --robot.type=so100_follower \
-        --robot.port=/dev/tty.usbmodem58FA0834591 \
-        --robot.id=so100_follower \
-        --robot.cameras="{ gripper: {type: opencv, index_or_path: 1, width: 640, height: 480, fps: 30}, front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \
-        --task="Move green small object into the purple platform" \
+        --robot.type=so101_follower \
+        --robot.port=/dev/ttyACM0 \
+        --robot.id=my_follower_arm \
+        --robot.cameras="{front: {type: opencv, index_or_path: /dev/video0, width: 640, height: 480, fps: 30}, wrist: {type: opencv, index_or_path: /dev/video2, width: 640, height: 480, fps: 30}}" \
+        --task="pick_doll_place" \
         --duration=120
 
-    # Run RTC with Real robot with pi0.5 policy
-    uv run examples/rtc/eval_with_real_robot.py \
-        --policy.path=helper2424/pi05_check_rtc \
+    # SmolVLA with RTC
+    python examples/rtc/eval_with_real_robot.py \
+        --policy.path=helper2424/smolvla_check_rtc_last3 \
         --policy.device=mps \
         --rtc.enabled=true \
         --rtc.execution_horizon=20 \
         --robot.type=so100_follower \
         --robot.port=/dev/tty.usbmodem58FA0834591 \
         --robot.id=so100_follower \
-        --robot.cameras="{ gripper: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}, front: {type: opencv, index_or_path: 1, width: 640, height: 480, fps: 30}}" \
+        --robot.cameras="{ gripper: {type: opencv, index_or_path: 1, width: 640, height: 480, fps: 30}, front: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \
         --task="Move green small object into the purple platform" \
         --duration=120
 """
@@ -73,6 +70,7 @@ import traceback
 from dataclasses import dataclass, field
 from threading import Event, Lock, Thread
 
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -86,6 +84,7 @@ from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 from lerobot.policies.rtc.action_queue import ActionQueue
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.policies.rtc.latency_tracker import LatencyTracker
+from lerobot.processor import InferenceImageTransformProcessorStep
 from lerobot.processor.factory import (
     make_default_robot_action_processor,
     make_default_robot_observation_processor,
@@ -99,12 +98,89 @@ from lerobot.robots import (  # noqa: F401
     so_follower,
 )
 from lerobot.robots.utils import make_robot_from_config
-from lerobot.utils.constants import OBS_IMAGES
+from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 from lerobot.utils.hub import HubMixin
+from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import init_logging
+
+POLICIES_WITH_QUEUES = ["flow_matching", "diffusion"]
+RTC_NATIVE_POLICIES = ["smolvla", "pi05", "pi0"]
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def parse_initial_position(position_str: str | None) -> list[float] | None:
+    """Parse initial position string like '[-5.71, -99.32, 99.64, 75.61, -45.98, 2.03]' to list of floats."""
+    if position_str is None:
+        return None
+    position_str = position_str.strip()
+    if position_str.startswith("["):
+        position_str = position_str[1:]
+    if position_str.endswith("]"):
+        position_str = position_str[:-1]
+    try:
+        return [float(x.strip()) for x in position_str.split(",")]
+    except ValueError as e:
+        logger.error(f"Failed to parse initial position: {e}")
+        return None
+
+
+def move_to_initial_position(
+    robot: Robot,
+    target_position: list[float],
+    duration_s: float = 3.0,
+    fps: int = 30,
+):
+    """Smoothly move the robot to the target position using cosine interpolation."""
+    logger.info(f"Moving to initial position: {target_position}")
+
+    obs = robot.get_observation()
+
+    if hasattr(robot, "action_features"):
+        motor_names = list(robot.action_features.keys())
+    else:
+        motor_names = sorted([k for k in obs if ".pos" in k])
+
+    if not motor_names:
+        logger.warning("Could not find motor names, skipping move to initial position")
+        return
+
+    current_position = []
+    for name in motor_names:
+        if name in obs:
+            current_position.append(float(obs[name]))
+        else:
+            logger.warning(f"Motor {name} not found in observation")
+            return
+
+    current_position = np.array(current_position)
+    target_position_arr = np.array(target_position)
+
+    if len(current_position) != len(target_position_arr):
+        logger.error(
+            f"Position dimension mismatch: current has {len(current_position)} joints, "
+            f"target has {len(target_position_arr)} joints. Motor names: {motor_names}"
+        )
+        return
+
+    logger.info(f"Motor names: {motor_names}")
+    logger.info(f"Current position: {current_position}")
+    logger.info(f"Target position: {target_position_arr}")
+
+    num_steps = int(duration_s * fps)
+    for step in range(num_steps):
+        t = (step + 1) / num_steps
+        t_smooth = 0.5 * (1 - np.cos(np.pi * t))
+        interpolated = current_position + t_smooth * (target_position_arr - current_position)
+
+        action = {}
+        for i, name in enumerate(motor_names):
+            action[name] = float(interpolated[i])
+        robot.send_action(action)
+        precise_sleep(1.0 / fps)
+
+    logger.info("Reached initial position")
 
 
 class RobotWrapper:
@@ -142,7 +218,7 @@ class RTCDemoConfig(HubMixin):
     # RTC configuration
     rtc: RTCConfig = field(
         default_factory=lambda: RTCConfig(
-            execution_horizon=10,
+            execution_horizon=40,
             max_guidance_weight=1.0,
             prefix_attention_schedule=RTCAttentionSchedule.EXP,
         )
@@ -150,17 +226,34 @@ class RTCDemoConfig(HubMixin):
 
     # Demo parameters
     duration: float = 30.0  # Duration to run the demo (seconds)
-    fps: float = 10.0  # Action execution frequency (Hz)
+    fps: float = 30.0  # Action execution frequency (Hz)
 
     # Compute device
     device: str | None = None  # Device to run on (cuda, cpu, auto)
 
     # Get new actions horizon. The amount of executed steps after which will be requested new actions.
     # It should be higher than inference delay + execution horizon.
-    action_queue_size_to_get_new_actions: int = 30
+    action_queue_size_to_get_new_actions: int = 24
 
     # Task to execute
     task: str = field(default="", metadata={"help": "Task to execute"})
+
+    # Image transforms for inference (to match training preprocessing)
+    center_crop_to_square: bool = field(
+        default=False,
+        metadata={"help": "Center crop images to square before resizing"},
+    )
+    resize_to: str | None = field(
+        default=None,
+        metadata={"help": "Resize images to [H,W], e.g. '[240,320]'"},
+    )
+
+    # Initial position for the robot before starting (list of joint positions as string)
+    initial_position: str | None = field(
+        default=None,
+        metadata={"help": "Initial joint positions, e.g. '[-5.71, -99.32, 99.64, 75.61, -45.98, 2.03]'"},
+    )
+    move_to_initial_time_s: float = 3.0
 
     # Torch compile configuration
     use_torch_compile: bool = field(
@@ -210,6 +303,26 @@ def is_image_key(k: str) -> bool:
     return k.startswith(OBS_IMAGES)
 
 
+def _prepare_obs_for_queue_policy(batch: dict[str, Tensor], policy) -> dict[str, Tensor]:
+    """Prepare observation and populate internal queues for FM/Diffusion policies.
+
+    These policies' predict_action_chunk reads from self._queues, so we must
+    stack images and call populate_queues before calling predict_action_chunk.
+    """
+    from lerobot.policies.utils import populate_queues
+
+    if ACTION in batch:
+        batch.pop(ACTION)
+
+    if policy.config.image_features:
+        batch = dict(batch)
+        images = [batch[key] for key in policy.config.image_features]
+        batch[OBS_IMAGES] = torch.stack(images, dim=1)  # (B, n_cameras, C, H, W)
+
+    policy._queues = populate_queues(policy._queues, batch)
+    return batch
+
+
 def get_actions(
     policy,
     robot: RobotWrapper,
@@ -220,36 +333,44 @@ def get_actions(
 ):
     """Thread function to request action chunks from the policy.
 
-    Args:
-        policy: The policy instance (SmolVLA, Pi0, etc.)
-        robot: The robot instance for getting observations
-        robot_observation_processor: Processor for raw robot observations
-        action_queue: Queue to put new action chunks
-        shutdown_event: Event to signal shutdown
-        cfg: Demo configuration
+    Supports SmolVLA/Pi0/Pi05 (native RTC) and FM/Diffusion (queue-based) policies.
     """
     try:
         logger.info("[GET_ACTIONS] Starting get actions thread")
 
-        latency_tracker = LatencyTracker()  # Track latency of action chunks
+        latency_tracker = LatencyTracker()
         fps = cfg.fps
         time_per_chunk = 1.0 / fps
+        policy_name = policy.name
 
         dataset_features = hw_to_dataset_features(robot.observation_features(), "observation")
         policy_device = policy.config.device
 
-        # Load preprocessor and postprocessor from pretrained files
-        # The stats are embedded in the processor .safetensors files
         logger.info(f"[GET_ACTIONS] Loading preprocessor/postprocessor from {cfg.policy.pretrained_path}")
 
         preprocessor, postprocessor = make_pre_post_processors(
             policy_cfg=cfg.policy,
             pretrained_path=cfg.policy.pretrained_path,
-            dataset_stats=None,  # Will load from pretrained processor files
+            dataset_stats=None,
             preprocessor_overrides={
                 "device_processor": {"device": cfg.policy.device},
             },
         )
+
+        if cfg.center_crop_to_square or cfg.resize_to is not None:
+            resize_to_val = None
+            if cfg.resize_to is not None:
+                resize_str = cfg.resize_to.strip().strip("[]")
+                resize_to_val = tuple(int(x.strip()) for x in resize_str.split(","))
+            image_transform_step = InferenceImageTransformProcessorStep(
+                center_crop_to_square=cfg.center_crop_to_square,
+                resize_to=resize_to_val,
+            )
+            preprocessor.steps.insert(0, image_transform_step)
+            logger.info(
+                f"[GET_ACTIONS] Added InferenceImageTransformProcessorStep: "
+                f"center_crop={cfg.center_crop_to_square}, resize_to={resize_to_val}"
+            )
 
         logger.info("[GET_ACTIONS] Preprocessor/postprocessor loaded successfully with embedded stats")
 
@@ -257,6 +378,8 @@ def get_actions(
 
         if not cfg.rtc.enabled:
             get_actions_threshold = 0
+
+        needs_queue_populate = policy_name in POLICIES_WITH_QUEUES
 
         while not shutdown_event.is_set():
             if action_queue.qsize() <= get_actions_threshold:
@@ -269,7 +392,6 @@ def get_actions(
 
                 obs = robot.get_observation()
 
-                # Apply robot observation processor
                 obs_processed = robot_observation_processor(obs)
 
                 obs_with_policy_features = build_dataset_frame(
@@ -288,42 +410,63 @@ def get_actions(
                     obs_with_policy_features[name] = obs_with_policy_features[name].unsqueeze(0)
                     obs_with_policy_features[name] = obs_with_policy_features[name].to(policy_device)
 
-                obs_with_policy_features["task"] = [cfg.task]  # Task should be a list, not a string!
+                obs_with_policy_features["task"] = [cfg.task]
                 obs_with_policy_features["robot_type"] = (
                     robot.robot.name if hasattr(robot.robot, "name") else ""
                 )
 
-                preproceseded_obs = preprocessor(obs_with_policy_features)
+                preprocessed_obs = preprocessor(obs_with_policy_features)
 
-                # Generate actions WITH RTC
-                actions = policy.predict_action_chunk(
-                    preproceseded_obs,
-                    inference_delay=inference_delay,
-                    prev_chunk_left_over=prev_actions,
-                )
+                # FM/Diffusion: must populate internal _queues before predict_action_chunk
+                if needs_queue_populate:
+                    preprocessed_obs = _prepare_obs_for_queue_policy(preprocessed_obs, policy)
 
-                # Store original actions (before postprocessing) for RTC
+                # RTC needs torch.autograd.grad inside denoise_step, which
+                # requires enable_grad() to work. inference_mode() cannot be
+                # overridden by enable_grad(), so fall back to no_grad().
+                grad_ctx = torch.no_grad() if cfg.rtc.enabled else torch.inference_mode()
+                with grad_ctx:
+                    actions = policy.predict_action_chunk(
+                        preprocessed_obs,
+                        inference_delay=inference_delay,
+                        prev_chunk_left_over=prev_actions,
+                    )
+
                 original_actions = actions.squeeze(0).clone()
 
                 postprocessed_actions = postprocessor(actions)
-
                 postprocessed_actions = postprocessed_actions.squeeze(0)
 
                 new_latency = time.perf_counter() - current_time
                 new_delay = math.ceil(new_latency / time_per_chunk)
                 latency_tracker.add(new_latency)
 
-                if cfg.action_queue_size_to_get_new_actions < cfg.rtc.execution_horizon + new_delay:
-                    logger.warning(
-                        "[GET_ACTIONS] cfg.action_queue_size_to_get_new_actions Too small, It should be higher than inference delay + execution horizon."
-                    )
+                if cfg.rtc.enabled:
+                    if cfg.action_queue_size_to_get_new_actions < cfg.rtc.execution_horizon + new_delay:
+                        logger.warning(
+                            "[GET_ACTIONS] action_queue_size_to_get_new_actions too small. "
+                            "Should be higher than inference delay + execution horizon."
+                        )
+                    if cfg.rtc.execution_horizon <= new_delay:
+                        logger.warning(
+                            f"[GET_ACTIONS] RTC MISCONFIGURED: execution_horizon={cfg.rtc.execution_horizon} "
+                            f"<= inference_delay={new_delay}. "
+                            f"RTC guidance covers new_chunk[0:{cfg.rtc.execution_horizon}] but robot executes "
+                            f"from new_chunk[{new_delay}] — the guided region is entirely skipped! "
+                            f"Set execution_horizon > {new_delay} to fix violent jerking."
+                        )
 
+                logger.info(f"merge_before{action_queue.qsize()}")
                 action_queue.merge(
                     original_actions, postprocessed_actions, new_delay, action_index_before_inference
                 )
+
+                logger.info(
+                    f"[GET_ACTIONS] Inference {new_latency*1000:.0f}ms | "
+                    f"delay={new_delay} | queue={action_queue.qsize()}"
+                )
             else:
-                # Small sleep to prevent busy waiting
-                time.sleep(0.1)
+                time.sleep(0.01)
 
         logger.info("[GET_ACTIONS] get actions thread shutting down")
     except Exception as e:
@@ -468,14 +611,19 @@ def demo_cli(cfg: RTCDemoConfig):
     else:
         policy = policy_class.from_pretrained(cfg.policy.pretrained_path, config=config)
 
-    # Turn on RTC
+    # Configure RTC
     policy.config.rtc_config = cfg.rtc
 
-    # Init RTC processort, as by default if RTC disabled in the config
-    # The processor won't be created
-    policy.init_rtc_processor()
-
-    assert policy.name in ["smolvla", "pi05", "pi0"], "Only smolvla, pi05, and pi0 are supported for RTC"
+    if policy.name in RTC_NATIVE_POLICIES:
+        policy.init_rtc_processor()
+    elif policy.name in POLICIES_WITH_QUEUES:
+        # FM/Diffusion: RTC processor is initialized in __init__ when rtc_config is set
+        if hasattr(policy, 'rtc_processor') and policy.rtc_processor is None and cfg.rtc.enabled:
+            from lerobot.policies.rtc.modeling_rtc import RTCProcessor
+            policy.rtc_processor = RTCProcessor(cfg.rtc)
+        logger.info(f"Policy '{policy.name}' configured for async inference (RTC={cfg.rtc.enabled})")
+    else:
+        logger.warning(f"Policy '{policy.name}' may not fully support RTC. Proceeding anyway.")
 
     policy = policy.to(cfg.device)
     policy.eval()
@@ -488,6 +636,19 @@ def demo_cli(cfg: RTCDemoConfig):
     logger.info(f"Initializing robot: {cfg.robot.type}")
     robot = make_robot_from_config(cfg.robot)
     robot.connect()
+
+    # Move to initial position if specified
+    initial_position = parse_initial_position(cfg.initial_position)
+    if initial_position is not None:
+        move_to_initial_position(
+            robot=robot,
+            target_position=initial_position,
+            duration_s=cfg.move_to_initial_time_s,
+            fps=int(cfg.fps),
+        )
+        time.sleep(0.5)
+        logger.info("Ready after moving to initial position")
+
     robot_wrapper = RobotWrapper(robot)
 
     # Create robot observation processor

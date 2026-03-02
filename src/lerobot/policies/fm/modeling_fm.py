@@ -1,3 +1,6 @@
+#python /home/zhang/robot/lerobot/examples/rtc/eval_with_real_robot.py     --policy.path=/home/zhang/robot/lerobot/outputs/train/2.14_307/cs64/fm/pretrained_model     --robot.type=so101_follower     --robot.port=/dev/ttyACM0     --robot.id=my_follower_arm     "--robot.cameras={front: {type: opencv, index_or_path: /dev/video0, width: 640, height: 480, fps: 30}, wrist: {type: opencv, index_or_path: /dev/video2, width: 640, height: 480, fps: 30}}"     --rtc.enabled=true     --rtc.execution_horizon=32     --rtc.max_guidance_weight=20.0     --action_queue_size_to_get_new_actions=40     --resize_to="[240,320]"     --initial_position="[-5.71, -99.32, 99.64, 75.61, -45.98, 2.03]"     --task=pick_doll_place     --fps=30     --duration=100000
+
+
 #!/usr/bin/env python
 
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
@@ -149,6 +152,9 @@ class FlowMatchingPolicy(PreTrainedPolicy):
             prev_chunk_left_over=kwargs.get("prev_chunk_left_over"),
             execution_horizon=kwargs.get("execution_horizon"),
         )
+        simluated_infer_latency = 0.15
+        time.sleep(simluated_infer_latency)
+        logging.info(f"Simulated inference latency: {simluated_infer_latency} seconds")
         return actions
 
     @torch.no_grad()
