@@ -41,7 +41,7 @@ Architecture:
        │                  │
        └──── AsyncActionQueue ────┘
 
-Usage (same args as lerobot_infer.py, plus --async_cfg.*):
+Usage (same args as lerobot_infer.py, plus --action_queue.*):
     python -m src.lerobot.scripts.lerobot_infer_async \\
         --robot.type=so101_follower \\
         --robot.port=/dev/ttyACM0 \\
@@ -57,7 +57,13 @@ Usage (same args as lerobot_infer.py, plus --async_cfg.*):
         --policy_training_dataset_root=/home/zhang/.cache/huggingface/lerobot/zhang/pick_doll_place_merged_09_13/ \\
         --policy.path=/home/zhang/robot/lerobot/outputs/train/2.14_307/cs64/fm/pretrained_model \\
         --policy.n_action_steps=64 \\
-        --async_cfg.queue_refill_threshold=4
+        --action_queue.type=threshold \\
+        --action_queue.refill_threshold=4
+
+    # Or with drop_delay queue:
+    #   --action_queue.type=drop_delay \\
+    #   --action_queue.refill_threshold=4 \\
+    #   --action_queue.drop_delay_n_steps=3
 """
 
 import logging
@@ -66,8 +72,6 @@ import sys
 import tempfile
 import time
 import traceback
-from abc import ABC, abstractmethod
-from collections import deque
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -79,6 +83,13 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from lerobot.action_queues import (
+    ActionQueueConfig,
+    BaseActionQueue,
+    DropDelayActionQueueConfig,  # noqa: F401 — triggers draccus registration
+    ThresholdActionQueueConfig,
+    make_action_queue_from_config,
+)
 from lerobot.cameras import CameraConfig  # noqa: F401
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
@@ -152,221 +163,6 @@ POLICIES_WITH_QUEUES = {"flow_matching", "diffusion"}
 
 
 # ─────────────────────────────────────────────
-#  Action queue base class + concrete subclasses
-# ─────────────────────────────────────────────
-
-class BaseActionQueue(ABC):
-    """Abstract base class for all async inference action queues.
-
-    Separates two orthogonal concerns so each can be extended independently:
-
-    1. **Inference trigger** — *when* to fire a new policy forward pass.
-       Override :meth:`should_request_inference` with any logic:
-       queue-depth threshold, fixed-FPS clock, policy confidence score, etc.
-
-    2. **Chunk integration** — *how* a new chunk is merged into the queue.
-       Override :meth:`put_chunk` for custom strategies: simple replace,
-       RTC-style temporal blending, confidence-weighted merge, etc.
-
-    Optional lifecycle hooks
-    ~~~~~~~~~~~~~~~~~~~~~~~~
-    :meth:`on_inference_start` and :meth:`on_inference_done` are called by
-    the inference thread around each forward pass so subclasses can update
-    internal state (e.g. a latency estimate used inside
-    ``should_request_inference``).
-    """
-
-    # ── Core interface (must implement) ─────────
-
-    @abstractmethod
-    def put_chunk(self, actions: Tensor) -> None:
-        """Integrate a new action chunk produced by the inference thread.
-
-        Args:
-            actions: ``(T, action_dim)`` tensor in *robot space*
-                     (already postprocessed / denormalised).
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def get(self) -> Tensor | None:
-        """Consume and return the next action step, or ``None`` if empty.
-
-        Called by the execution thread at fixed FPS.
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def qsize(self) -> int:
-        """Number of unconsumed action steps currently held."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def clear(self) -> None:
-        """Discard all pending actions (e.g. at episode boundaries)."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def should_request_inference(self) -> bool:
-        """Return ``True`` when the inference thread should start a new forward pass.
-
-        Called continuously (in a tight loop) by the inference thread.
-        Implementations may inspect queue depth, wall-clock time, policy
-        internal state, or any other signal.
-        """
-        raise NotImplementedError
-
-    # ── Optional lifecycle hooks (may override) ──
-
-    def on_inference_start(self) -> None:
-        """Hook called by the inference thread *before* each forward pass."""
-
-    def on_inference_done(self, latency_s: float) -> None:
-        """Hook called by the inference thread *after* each forward pass.
-
-        Args:
-            latency_s: Wall-clock duration of the forward pass in seconds.
-                       Useful for adaptive trigger strategies.
-        """
-
-
-# ─────────────────────────────────────────────
-
-class ThresholdActionQueue(BaseActionQueue):
-    """Simple FIFO queue that triggers inference when depth falls to a threshold.
-
-    This is the default, minimal-overhead implementation.
-
-    Trigger:   ``qsize() <= refill_threshold``
-    Integrate: replace – discard any remaining old actions, load fresh chunk.
-
-    To extend behaviour without touching the rest of the pipeline, subclass
-    this (or ``BaseActionQueue``) and swap it in via ``AsyncConfig.queue_cls``.
-
-    Example subclasses
-    ~~~~~~~~~~~~~~~~~~
-    * **FixedIntervalQueue** – override ``should_request_inference`` to fire
-      every ``1 / inference_fps`` seconds regardless of queue depth.
-    * **RTCQueue** – override ``put_chunk`` to blend old and new chunks with
-      temporal interpolation instead of hard replacing.
-    * **ConfidenceQueue** – override ``should_request_inference`` to also
-      accept a policy uncertainty score stored via ``on_inference_done``.
-    """
-
-    def __init__(self, refill_threshold: int = 0):
-        """
-        Args:
-            refill_threshold: Fire inference when ``qsize() <= refill_threshold``.
-                ``0``  → only when queue is empty (may stutter if inference is slow).
-                ``>0`` → overlap execution with inference; set to roughly the number
-                         of steps inference takes at the target FPS.
-        """
-        self._deque: deque[Tensor] = deque()
-        self._lock = Lock()
-        self.refill_threshold = refill_threshold
-
-    # ── BaseActionQueue implementation ──────────
-
-    def put_chunk(self, actions: Tensor) -> None:
-        """Replace queue contents with a new chunk (hard reset, no blending)."""
-        actions = actions.detach().cpu()
-        with self._lock:
-            self._deque.clear()
-            for i in range(len(actions)):
-                self._deque.append(actions[i].clone())
-
-    def get(self) -> Tensor | None:
-        with self._lock:
-            return self._deque.popleft() if self._deque else None
-
-    def qsize(self) -> int:
-        with self._lock:
-            return len(self._deque)
-
-    def clear(self) -> None:
-        with self._lock:
-            self._deque.clear()
-
-    def should_request_inference(self) -> bool:
-        return self.qsize() <= self.refill_threshold
-
-
-class DropDelayActionQueue(ThresholdActionQueue):
-    """Threshold queue that discards the first N actions of every new chunk.
-
-    Motivation
-    ~~~~~~~~~~
-    Policy inference is not instantaneous.  While the inference thread is
-    running a forward pass (taking, say, ``D`` execution steps worth of
-    time), the robot keeps executing actions from the *old* chunk.  When the
-    new chunk finally arrives its first ``D`` actions describe what the robot
-    *should have been doing* during inference — they are already stale.
-
-    By dropping ``drop_delay_n_steps`` actions from the front of each chunk
-    we skip directly to the actions that are relevant *now*, reducing the
-    lag between observation and execution.
-
-    Typical usage
-    ~~~~~~~~~~~~~
-    Measure the average inference latency in steps
-    (``latency_s * fps``), then set ``drop_delay_n_steps`` to that value::
-
-        queue = DropDelayActionQueue(
-            drop_delay_n_steps=4,   # ~133 ms at 30 fps
-            refill_threshold=4,
-        )
-
-    .. note::
-        If ``drop_delay_n_steps >= len(actions)`` the entire chunk is
-        discarded and a warning is logged.  Tune the value so it stays
-        well below ``n_action_steps``.
-    """
-
-    def __init__(self, drop_delay_n_steps: int = 0, **kwargs):
-        """
-        Args:
-            drop_delay_n_steps: Number of leading actions to drop from each
-                new chunk.  ``0`` disables the feature (identical to
-                ``ThresholdActionQueue``).
-                The **first** chunk of every episode is never trimmed regardless
-                of this value, because no inference delay has accumulated yet.
-            **kwargs: Forwarded to :class:`ThresholdActionQueue`
-                (e.g. ``refill_threshold``).
-        """
-        super().__init__(**kwargs)
-        if drop_delay_n_steps < 0:
-            raise ValueError(f"drop_delay_n_steps must be >= 0, got {drop_delay_n_steps}")
-        self.drop_delay_n_steps = drop_delay_n_steps
-        self._is_first_chunk = True
-
-    def put_chunk(self, actions: Tensor) -> None:
-        """Store chunk, skipping the delay-drop for the very first chunk."""
-        if self._is_first_chunk:
-            # No inference delay has accumulated yet — use the full chunk.
-            self._is_first_chunk = False
-        elif self.drop_delay_n_steps > 0:
-            if self.drop_delay_n_steps >= len(actions):
-                logger.warning(
-                    f"[DropDelayActionQueue] drop_delay_n_steps={self.drop_delay_n_steps} "
-                    f">= chunk length={len(actions)}; entire chunk discarded. "
-                    "Reduce drop_delay_n_steps or increase n_action_steps."
-                )
-                return
-            actions = actions[self.drop_delay_n_steps:]
-
-        super().put_chunk(actions)
-
-    def clear(self) -> None:
-        """Discard all actions and reset first-chunk flag (episode boundary)."""
-        super().clear()
-        self._is_first_chunk = True
-
-
-# Convenience alias used throughout this file and in AsyncConfig.
-AsyncActionQueue = ThresholdActionQueue
-
-
-# ─────────────────────────────────────────────
 #  Thread-safe robot wrapper
 # ─────────────────────────────────────────────
 
@@ -408,23 +204,14 @@ class RobotWrapper:
 # ─────────────────────────────────────────────
 
 @dataclass
-class AsyncConfig:
-    """Configuration for async inference decoupling."""
-    # Request new actions when queue has this many or fewer actions.
-    # Increase if inference is slow relative to fps to avoid action starvation.
-    queue_refill_threshold: int = 0
-    # Drop the first N actions of each new chunk to compensate for inference
-    # latency (set to roughly latency_s * fps). The very first chunk of each
-    # episode is never trimmed. 0 = disabled (ThresholdActionQueue).
-    drop_delay_n_steps: int = 0
-
-
-@dataclass
 class AsyncRecordConfig:
     """Configuration for async record.
 
-    Almost identical to RecordConfig in lerobot_infer.py with an added
-    ``async_cfg`` field for the queue/threading parameters.
+    Almost identical to RecordConfig in lerobot_infer.py with an
+    ``action_queue`` field that selects the queue type from the CLI::
+
+        --action_queue.type=threshold --action_queue.refill_threshold=4
+        --action_queue.type=drop_delay --action_queue.drop_delay_n_steps=3
     """
     robot: RobotConfig
     dataset: DatasetRecordConfig
@@ -432,8 +219,8 @@ class AsyncRecordConfig:
     # Policy (optional – if None the robot won't move)
     policy: PreTrainedConfig | None = None
 
-    # Async queue configuration
-    async_cfg: AsyncConfig = field(default_factory=AsyncConfig)
+    # Action queue strategy (resolved via --action_queue.type=...)
+    action_queue: ActionQueueConfig = field(default_factory=lambda: ThresholdActionQueueConfig())
 
     # Local path to training dataset (avoids network calls for stats/features)
     policy_training_dataset_root: str | Path | None = None
@@ -720,22 +507,7 @@ def _run_episodes(
 ):
     """Run all recording episodes with async inference threads."""
 
-    if cfg.async_cfg.drop_delay_n_steps > 0:
-        action_queue = DropDelayActionQueue(
-            drop_delay_n_steps=cfg.async_cfg.drop_delay_n_steps,
-            refill_threshold=cfg.async_cfg.queue_refill_threshold,
-        )
-        logger.info(
-            f"Using DropDelayActionQueue: drop_delay_n_steps={cfg.async_cfg.drop_delay_n_steps}, "
-            f"refill_threshold={cfg.async_cfg.queue_refill_threshold}"
-        )
-    else:
-        action_queue = AsyncActionQueue(
-            refill_threshold=cfg.async_cfg.queue_refill_threshold,
-        )
-        logger.info(
-            f"Using ThresholdActionQueue: refill_threshold={cfg.async_cfg.queue_refill_threshold}"
-        )
+    action_queue = make_action_queue_from_config(cfg.action_queue)
 
     episode_active = Event()
     shutdown_event = Event()
