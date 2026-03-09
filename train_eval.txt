@@ -68,6 +68,8 @@ lerobot-train     --dataset.repo_id=lerobot/aloha_sim_transfer_cube_human     --
 
 lerobot-train --dataset.repo_id=dksen/pick_doll_place_merged_09_13 --dataset.root=E:\cys\dataset\pick_doll_place_merged_09_13 --policy.type=flow_matching --steps=100000 --batch_size=64 --eval_freq=10000 --save_freq=50000 --dataset.image_transforms.enable=false --policy.device=cuda --policy.use_amp=true --policy.push_to_hub=false --policy.pretrained_backbone_weights=ResNet18_Weights.IMAGENET1K_V1 --policy.use_group_norm=false --policy.backbone_lr_scale=0.1 --wandb.enable=false --wandb.project=pick_doll_place --dataset.image_transforms.resize_to=[240,320]
 
+lerobot-train     --dataset.repo_id=lerobot/aloha_sim_transfer_cube_scripted     --policy.type=florence2_oft     --policy.vlm_model_name_or_path=microsoft/Florence-2-base     --policy.chunk_size=16     --policy.n_action_steps=16     --steps=10000     --batch_size=16     --eval_freq=2000     --save_freq=10000     --dataset.image_transforms.enable=false     --policy.device=cuda     --policy.use_amp=true     --policy.push_to_hub=false     --wandb.enable=true     --wandb.project=aloha_florence2_oft     --env.type=aloha     --env.task=AlohaTransferCube-v0 --dataset.image_transforms.resize_to=[384,384] --policy.use_multi_view=false --eval.batch_size=8 --eval.n_episodes=50
+
 
 模型评估
 

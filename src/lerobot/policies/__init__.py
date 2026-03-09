@@ -14,6 +14,7 @@
 
 from .act.configuration_act import ACTConfig as ACTConfig
 from .diffusion.configuration_diffusion import DiffusionConfig as DiffusionConfig
+from .florence2_oft.configuration_florence2_oft import Florence2OFTConfig as Florence2OFTConfig
 from .groot.configuration_groot import GrootConfig as GrootConfig
 from .mlp.configuration_mlp import MLPConfig as MLPConfig
 from .pi0.configuration_pi0 import PI0Config as PI0Config
@@ -29,6 +30,7 @@ from .xvla.configuration_xvla import XVLAConfig as XVLAConfig
 __all__ = [
     "ACTConfig",
     "DiffusionConfig",
+    "Florence2OFTConfig",
     "MLPConfig",
     "PI0Config",
     "PI05Config",
