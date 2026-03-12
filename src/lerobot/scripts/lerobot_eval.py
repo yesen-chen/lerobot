@@ -544,7 +544,7 @@ def eval_main(cfg: EvalPipelineConfig):
         pretrained_path=cfg.policy.pretrained_path,
         preprocessor_overrides=preprocessor_overrides,
     )
-
+    print("preprocessor:", preprocessor)
     # Create environment-specific preprocessor and postprocessor (e.g., for LIBERO environments)
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(
         env_cfg=cfg.env, policy_cfg=cfg.policy, image_transforms=None

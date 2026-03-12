@@ -267,9 +267,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                 "norm_map": policy.config.normalization_mapping,
             },
         }
-        processor_kwargs["preprocessor_overrides"]["rename_observations_processor"] = {
-            "rename_map": cfg.rename_map
-        }
+        if cfg.rename_map:
+            processor_kwargs["preprocessor_overrides"]["rename_observations_processor"] = {
+                "rename_map": cfg.rename_map
+            }
         postprocessor_kwargs["postprocessor_overrides"] = {
             "unnormalizer_processor": {
                 "stats": dataset.meta.stats,
@@ -284,6 +285,47 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         **processor_kwargs,
         **postprocessor_kwargs,
     )
+
+    # When training from scratch with a rename_map, the factory creates
+    # RenameObservationsProcessorStep with an empty map (preprocessor_overrides
+    # are only consumed by the from_pretrained path). Patch the step directly
+    # so that training-time eval correctly remaps env observation keys.
+    if cfg.rename_map:
+        from lerobot.processor.rename_processor import RenameObservationsProcessorStep
+
+        patched = False
+        for step in preprocessor.steps:
+            if isinstance(step, RenameObservationsProcessorStep):
+                step.rename_map = cfg.rename_map
+                patched = True
+                break
+        if not patched:
+            logging.warning("rename_map provided but no RenameObservationsProcessorStep found in preprocessor")
+
+    # Verify that policy image_features keys match what the preprocessor
+    # will produce (dataset keys during training, env keys after rename during eval).
+    if is_main_process and cfg.rename_map and cfg.env is not None:
+        env_img_keys = set()
+        for raw_key, mapped_key in cfg.env.features_map.items():
+            if mapped_key.startswith("observation.images"):
+                renamed = cfg.rename_map.get(mapped_key, mapped_key)
+                env_img_keys.add(renamed)
+
+        policy_img_keys = set(policy.config.image_features.keys()) if hasattr(policy.config, "image_features") else set()
+        ds_img_keys = {k for k in dataset.meta.features if k.startswith("observation.images")}
+
+        logging.info(f"[Key check] dataset image keys : {ds_img_keys}")
+        logging.info(f"[Key check] policy  image keys : {policy_img_keys}")
+        logging.info(f"[Key check] env image keys (after rename): {env_img_keys}")
+
+        if policy_img_keys and env_img_keys != policy_img_keys:
+            logging.warning(
+                f"[Key mismatch] env image keys after rename {env_img_keys} "
+                f"!= policy image keys {policy_img_keys}. "
+                f"Training-time eval may only use a subset of cameras!"
+            )
+
+    print("preprocessor:", preprocessor)
 
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
@@ -347,6 +389,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             dataset.meta.episodes["dataset_to_index"],
             episode_indices_to_use=dataset.episodes,
             drop_n_last_frames=cfg.policy.drop_n_last_frames,
+            # Keep temporal continuity inside episodes for LIBERO baseline alignment.
+            #shuffle=False,
             shuffle=True,
         )
     else:
@@ -360,6 +404,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         shuffle=shuffle and not cfg.dataset.streaming,
         sampler=sampler,
         pin_memory=device.type == "cuda",
+        #drop_last=True,
         drop_last=False,
         prefetch_factor=2 if cfg.num_workers > 0 else None,
     )

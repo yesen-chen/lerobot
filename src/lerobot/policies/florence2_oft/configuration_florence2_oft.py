@@ -74,7 +74,7 @@ class Florence2OFTConfig(PreTrainedConfig):
     freeze_backbone: bool = False
 
     # Training presets aligned with openpi_lora.yaml
-    optimizer_lr: float = 5e-5
+    optimizer_lr: float = 1e-5
     optimizer_betas: tuple = (0.9, 0.95)
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 1e-10
