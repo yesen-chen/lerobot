@@ -56,7 +56,7 @@ class LiberoProcessorStep(ObservationProcessorStep):
                 img = processed_obs[key]
 
                 # Flip both H and W
-                img = torch.flip(img, dims=[2, 3])
+                #img = torch.flip(img, dims=[2, 3])
 
                 processed_obs[key] = img
         # Process robot_state into a flat state vector
