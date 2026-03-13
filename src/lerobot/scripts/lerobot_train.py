@@ -319,7 +319,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(f"[Key check] env image keys (after rename): {env_img_keys}")
 
         if policy_img_keys and env_img_keys != policy_img_keys:
-            logging.warning(
+            raise ValueError(
                 f"[Key mismatch] env image keys after rename {env_img_keys} "
                 f"!= policy image keys {policy_img_keys}. "
                 f"Training-time eval may only use a subset of cameras!"

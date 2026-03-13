@@ -189,6 +189,8 @@ def rollout(
         observation, reward, terminated, truncated, info = env.step(action_numpy)
         if render_callback is not None:
             render_callback(env)
+        if reward[0]>0:
+            print("OK")
 
         # VectorEnv stores is_success in `info["final_info"][env_index]["is_success"]`. "final_info" isn't
         # available if none of the envs finished.
@@ -523,12 +525,29 @@ def eval_main(cfg: EvalPipelineConfig):
         trust_remote_code=cfg.trust_remote_code,
     )
 
+    # When no explicit rename_map is provided, try to recover it from the
+    # saved preprocessor config so that make_policy can skip the feature
+    # mismatch validation and the preprocessor keeps the correct mapping.
+    effective_rename_map = cfg.rename_map
+    if not effective_rename_map and cfg.policy.pretrained_path:
+        preprocessor_cfg_path = Path(cfg.policy.pretrained_path) / "policy_preprocessor.json"
+        if preprocessor_cfg_path.exists():
+            with open(preprocessor_cfg_path) as f:
+                preprocessor_cfg = json.load(f)
+            for step in preprocessor_cfg.get("steps", []):
+                if step.get("registry_name") == "rename_observations_processor":
+                    saved_map = step.get("config", {}).get("rename_map", {})
+                    if saved_map:
+                        effective_rename_map = saved_map
+                        logging.info(f"Loaded rename_map from checkpoint: {effective_rename_map}")
+                    break
+
     logging.info("Making policy.")
 
     policy = make_policy(
         cfg=cfg.policy,
         env_cfg=cfg.env,
-        rename_map=cfg.rename_map,
+        rename_map=effective_rename_map,
     )
 
     policy.eval()
@@ -536,8 +555,11 @@ def eval_main(cfg: EvalPipelineConfig):
     # The inference device is automatically set to match the detected hardware, overriding any previous device settings from training to ensure compatibility.
     preprocessor_overrides = {
         "device_processor": {"device": str(policy.config.device)},
-        "rename_observations_processor": {"rename_map": cfg.rename_map},
     }
+    # Only override rename_map when explicitly provided; an empty override
+    # would clear the rename_map saved in the pretrained checkpoint.
+    if cfg.rename_map:
+        preprocessor_overrides["rename_observations_processor"] = {"rename_map": cfg.rename_map}
 
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
@@ -549,6 +571,40 @@ def eval_main(cfg: EvalPipelineConfig):
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(
         env_cfg=cfg.env, policy_cfg=cfg.policy, image_transforms=None
     )
+
+    # Verify that env image keys (after rename) match the policy's expected image keys.
+    # A mismatch here usually means rename_map is missing or incorrect.
+    if cfg.env is not None and hasattr(cfg.env, "features_map"):
+        from lerobot.processor.rename_processor import RenameObservationsProcessorStep
+
+        effective_rename_map = {}
+        for step in preprocessor.steps:
+            if isinstance(step, RenameObservationsProcessorStep):
+                effective_rename_map = step.rename_map
+                break
+
+        env_img_keys = set()
+        for raw_key, mapped_key in cfg.env.features_map.items():
+            if mapped_key.startswith("observation.images"):
+                renamed = effective_rename_map.get(mapped_key, mapped_key)
+                env_img_keys.add(renamed)
+
+        policy_img_keys = (
+            set(policy.config.image_features.keys())
+            if hasattr(policy.config, "image_features")
+            else set()
+        )
+
+        logging.info(f"[Key check] env image keys (after rename): {env_img_keys}")
+        logging.info(f"[Key check] policy  image keys           : {policy_img_keys}")
+        logging.info(f"[Key check] effective rename_map          : {effective_rename_map}")
+
+        if policy_img_keys and env_img_keys != policy_img_keys:
+            raise ValueError(
+                f"[Key MISMATCH] env image keys after rename {env_img_keys} "
+                f"!= policy image keys {policy_img_keys}. "
+                f"Check --rename_map or the saved preprocessor rename_map."
+            )
 
     with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
         info = eval_policy_all(

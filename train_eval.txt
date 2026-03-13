@@ -72,6 +72,9 @@ lerobot-train     --dataset.repo_id=lerobot/aloha_sim_transfer_cube_scripted    
 
 lerobot-train   --dataset.repo_id=HuggingFaceVLA/libero   --policy.type=florence2_oft   --policy.vlm_model_name_or_path=microsoft/Florence-2-base   --policy.chunk_size=16   --policy.n_action_steps=16   --steps=10000   --batch_size=4   --eval_freq=2000   --save_freq=10000   --dataset.image_transforms.enable=false   --dataset.image_transforms.resize_to=[256,256]   --policy.device=cuda   --policy.use_amp=true   --policy.push_to_hub=false   --wandb.enable=true   --wandb.project=libero_florence2_oft   --env.type=libero   --env.task=libero_object   --policy.use_multi_view=true   --eval.batch_size=2   --eval.n_episodes=10
 
+lerobot-train   --dataset.repo_id=HuggingFaceVLA/libero   --policy.type=smolvla   --policy.load_vlm_weights=true   --policy.vlm_model_name=HuggingFaceTB/SmolVLM2-500M-Video-Instruct   --policy.chunk_size=10   --policy.n_action_steps=10   --steps=100000   --batch_size=16   --eval_freq=10000   --save_freq=100000   --env.type=libero   --env.task=libero_goal   --eval.batch_size=2   --eval.n_episodes=4   --wandb.enable=true   --wandb.project=libero_smolvla   --policy.push_to_hub=false   --output_dir=./debug/smolvla_libero_goal --dataset.root=/home/zhang/robot/libero_dataset/libero_goal_image --rename_map='{"observation.images.image2":"observation.images.wrist_image"}'
+
+
 模型评估
 
 python -m src.lerobot.scripts.lerobot_infer  \
@@ -89,6 +92,8 @@ python -m src.lerobot.scripts.lerobot_infer  \
 --dataset.episode_time_s=100000 \
 --image_transforms.resize_to=[120,160] \
 --initial_position="[-5.71, -99.32, 99.64, 75.61, -45.98, 2.03]"
+
+lerobot-eval     --policy.path=./debug/smolvla_libero_goal/checkpoints/100000/pretrained_model     --env.type=libero     --env.task=libero_goal     --eval.batch_size=2     --eval.n_episodes=4     --policy.device=cuda     --output_dir=./debug/smolvla_libero_goal/eval
 
 
 同步
