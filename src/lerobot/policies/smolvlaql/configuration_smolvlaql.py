@@ -46,3 +46,29 @@ class SmolVLAQLConfig(SmolVLAConfig):
 
     # Ensemble Q-value aggregation: "mean" or "min"
     qc_q_agg: str = "mean"
+
+    # Actor type: "distill-ddpg" (one-step MLP, fast) or "best-of-n" (multi-step denoise)
+    qc_actor_type: str = "distill-ddpg"
+
+    # Distillation loss coefficient for distill-ddpg actor
+    qc_alpha: float = 100.0
+
+    # One-step action head MLP hidden layer dims (4 layers to match acfql reference)
+    qc_onestep_hidden_dims: tuple[int, ...] = (512, 512, 512, 512)
+
+    # Inference mode: "onestep" uses the distilled MLP, "flow" uses iterative flow matching
+    qc_eval_mode: str = "onestep"
+
+    @property
+    def observation_delta_indices(self) -> list:
+        # s_t (当前帧) 和 s_{t+chunk_size} (chunk 执行后的下一帧，用于 TD target)
+        return [0, self.chunk_size]
+
+    @property
+    def action_delta_indices(self) -> list:
+        return list(range(self.chunk_size))
+
+    @property
+    def reward_delta_indices(self) -> list:
+        # chunk 内每一步的 reward/done/terminated: [0, 1, ..., chunk_size-1]
+        return list(range(self.chunk_size))

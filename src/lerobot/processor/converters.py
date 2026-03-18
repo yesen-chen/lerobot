@@ -158,7 +158,9 @@ def _extract_complementary_data(batch: dict[str, Any]) -> dict[str, Any]:
     """
     Extract complementary data from a batch dictionary.
 
-    This includes padding flags, task description, and indices.
+    This includes padding flags, task description, indices, and any extra
+    ``next.*`` keys (e.g. ``next.terminated``, ``next.success``) that are not
+    part of the standard transition schema (reward / done / truncated).
 
     Args:
         batch: The batch dictionary.
@@ -166,6 +168,8 @@ def _extract_complementary_data(batch: dict[str, Any]) -> dict[str, Any]:
     Returns:
         A dictionary with the extracted complementary data.
     """
+    _STANDARD_NEXT_KEYS = {REWARD, DONE, TRUNCATED}
+
     pad_keys = {k: v for k, v in batch.items() if "_is_pad" in k}
     task_key = {"task": batch["task"]} if "task" in batch else {}
     subtask_key = {"subtask": batch["subtask"]} if "subtask" in batch else {}
@@ -173,7 +177,15 @@ def _extract_complementary_data(batch: dict[str, Any]) -> dict[str, Any]:
     task_index_key = {"task_index": batch["task_index"]} if "task_index" in batch else {}
     episode_index_key = {"episode_index": batch["episode_index"]} if "episode_index" in batch else {}
 
-    return {**pad_keys, **task_key, **subtask_key, **index_key, **task_index_key, **episode_index_key}
+    extra_next_keys = {
+        k: v for k, v in batch.items()
+        if k.startswith("next.") and k not in _STANDARD_NEXT_KEYS and "_is_pad" not in k
+    }
+
+    return {
+        **pad_keys, **task_key, **subtask_key, **index_key,
+        **task_index_key, **episode_index_key, **extra_next_keys,
+    }
 
 
 def create_transition(

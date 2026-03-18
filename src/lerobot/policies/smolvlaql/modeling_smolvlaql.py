@@ -225,6 +225,43 @@ class ValueHead(nn.Module):
         return self.mlp(pooled).squeeze(-1)  # (B,)
 
 
+class OnestepActionHead(nn.Module):
+    """Per-timestep MLP: noise_hidden -> action.
+
+    Takes expert hidden states from processing noise at t=1 (which contain full
+    observation context via cross-attention to prefix), and predicts clean actions
+    in a single forward pass. The MLP is shared across all chunk timesteps.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        hidden_dims: tuple[int, ...] = (512, 512, 512, 512),
+    ):
+        super().__init__()
+        layers = []
+        prev_dim = input_dim
+        for dim in hidden_dims:
+            layers.extend([
+                nn.Linear(prev_dim, dim),
+                nn.LayerNorm(dim),
+                nn.SiLU(),
+            ])
+            prev_dim = dim
+        layers.append(nn.Linear(prev_dim, output_dim))
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, noise_hidden: Tensor) -> Tensor:
+        """
+        Args:
+            noise_hidden: (B, chunk_size, input_dim) — expert hidden from noise at t=1.
+        Returns:
+            (B, chunk_size, output_dim) — predicted action chunk.
+        """
+        return self.mlp(noise_hidden)
+
+
 # ==================== Policy ====================
 
 
@@ -267,26 +304,34 @@ class SmolVLAQLPolicy(PreTrainedPolicy):
                 model_value.rtc_processor = self.rtc_processor
 
     def get_optim_params(self) -> dict:
-        """Return separate parameter groups for policy and critic optimizers.
+        """Return separate parameter groups for policy, onestep_head, and critic optimizers.
+
+        Splitting onestep_head from the backbone prevents alpha-amplified distill
+        gradients from dominating gradient clipping of the VLM/Expert backbone.
 
         Returns:
             dict with keys:
-                "policy": list of params for flow matching training
-                         (expert backbone + action projections + state_proj)
-                "critic": list of params for Q-value training
-                         (value_heads only, excluding frozen target_value_heads)
+                "backbone": VLM + Expert + action projections + state_proj
+                "onestep":  onestep_head only (receives distill_loss + q_loss gradients)
+                "critic":   value_heads (excluding frozen target_value_heads)
         """
-        policy_params = []
+        backbone_params = []
+        onestep_params = []
         critic_params = []
         for name, param in self.named_parameters():
             if not param.requires_grad:
                 continue
             if "value_heads" in name and "target_value_heads" not in name:
                 critic_params.append(param)
-            elif "target_value_heads" not in name:
-                policy_params.append(param)
+            elif "target_value_heads" in name:
+                continue
+            elif "onestep_head" in name:
+                onestep_params.append(param)
+            else:
+                backbone_params.append(param)
         return {
-            "policy": policy_params,
+            "backbone": backbone_params,
+            "onestep": onestep_params,
             "critic": critic_params,
         }
 
@@ -304,7 +349,12 @@ class SmolVLAQLPolicy(PreTrainedPolicy):
 
         use_best_of_n = kwargs.pop("use_best_of_n", False)
 
-        if use_best_of_n:
+        eval_mode = getattr(self.config, "qc_eval_mode", "onestep")
+        if self.config.qc_actor_type == "distill-ddpg" and eval_mode == "onestep":
+            actions = self.model.sample_actions_onestep(
+                images, img_masks, lang_tokens, lang_masks, state, noise=noise
+            )
+        elif use_best_of_n:
             actions = self.model.sample_actions_best_of_n(
                 images, img_masks, lang_tokens, lang_masks, state
             )
@@ -362,9 +412,16 @@ class SmolVLAQLPolicy(PreTrainedPolicy):
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
 
     def forward(
-        self, batch: dict[str, Tensor], noise=None, time=None, reduction: str = "mean"
+        self, batch: dict[str, Tensor], noise=None, time=None, reduction: str = "mean",
     ) -> dict[str, Tensor]:
-        """Flow matching training forward (same as base SmolVLA)."""
+        """Flow matching training forward (actor BC loss).
+
+        关于 action padding 的处理：
+        LeRobot 的 _get_query_indices 已将越界 action index clamp 到 episode 内，
+        并标记 action_is_pad=True。此处用 action_is_pad 屏蔽 padded action 的 loss，
+        无需额外的 valid mask（ACFQL 的 valid 是为了处理跨 episode 采样，
+        LeRobot 不存在该问题）。
+        """
         if self.config.adapt_to_pi_aloha:
             batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
             batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
@@ -374,9 +431,9 @@ class SmolVLAQLPolicy(PreTrainedPolicy):
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
         actions = self.prepare_action(batch)
-        actions_is_pad = batch.get("actions_id_pad")
+        actions_is_pad = batch["action_is_pad"]
         loss_dict = {}
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+        losses, _fwd_info = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
         loss_dict["losses_after_forward"] = losses.clone().mean().item()
 
         if actions_is_pad is not None:
@@ -384,7 +441,8 @@ class SmolVLAQLPolicy(PreTrainedPolicy):
             losses = losses * in_episode_bound.unsqueeze(-1)
             loss_dict["losses_after_in_ep_bound"] = losses.clone().mean().item()
 
-        losses = losses[:, :, : self.config.max_action_dim]
+        #actual_action_dim = self.config.action_feature.shape[0]
+        losses = losses[:, :, :self.config.max_action_dim]
         loss_dict["losses_after_rm_padding"] = losses.clone().mean().item()
 
         if reduction == "none":
@@ -396,12 +454,176 @@ class SmolVLAQLPolicy(PreTrainedPolicy):
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 
+    def forward_actor(
+        self, batch: dict[str, Tensor],
+    ) -> tuple[Tensor, dict]:
+        """Combined actor loss for distill-ddpg mode.
+
+        actor_loss = bc_flow_loss + alpha * distill_loss + q_loss
+
+        When qc_actor_type != "distill-ddpg", falls back to standard forward().
+
+        Returns:
+            total_loss: scalar
+            loss_dict: diagnostic info
+        """
+        if self.config.qc_actor_type != "distill-ddpg":
+            return self.forward(batch)
+
+        # --- 1) BC flow loss (reuse existing forward, which also gives us prefix_out) ---
+        if self.config.adapt_to_pi_aloha:
+            batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
+            batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
+
+        images, img_masks = self.prepare_images(batch)
+        state = self.prepare_state(batch)
+        lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
+        lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+        actions = self.prepare_action(batch)
+        actions_is_pad = batch["action_is_pad"]
+
+        losses, fwd_info = self.model.forward(
+            images, img_masks, lang_tokens, lang_masks, state, actions
+        )
+
+        if actions_is_pad is not None:
+            in_episode_bound = ~actions_is_pad
+            losses = losses * in_episode_bound.unsqueeze(-1)
+
+        #actual_ad = self.config.action_feature.shape[0]
+        losses = losses[:, :, :self.config.max_action_dim]
+        bc_flow_loss = losses.mean()
+
+        prefix_embs = fwd_info["prefix_embs"]
+        prefix_pad_masks = fwd_info["prefix_pad_masks"]
+        prefix_att_masks = fwd_info["prefix_att_masks"]
+        prefix_out = fwd_info["prefix_out"]
+
+        # --- 2) Distillation loss: MSE(onestep_actions, flow_actions.detach()) ---
+        B = actions.shape[0]
+        device = actions.device
+        distill_noise = self.model.sample_noise(
+            (B, self.config.chunk_size, self.config.max_action_dim), device
+        )
+
+        flow_actions = self.model.compute_flow_actions(
+            prefix_embs.detach(), prefix_pad_masks, prefix_att_masks, distill_noise
+        )
+
+        onestep_actions = self.model.sample_onestep_actions(
+            prefix_embs.detach(), prefix_pad_masks, prefix_att_masks, noise=distill_noise
+        )
+        actual_action_dim = self.config.action_feature.shape[0]
+        distill_loss = F.mse_loss(
+            onestep_actions[:, :, :actual_action_dim],
+            flow_actions[:, :, :actual_action_dim],
+            reduction="mean",
+        )
+
+        # --- 3) Q loss: maximize Q-value of one-step actions ---
+        # We want q_loss to ONLY update onestep_head, not expert/action_in_proj/etc.
+        # Strategy: compute dQ/da via torch.autograd.grad (no gradient accumulation
+        # on expert params), then build a surrogate loss that only back-props to onestep_head.
+        actions_for_q = onestep_actions.detach().clamp(-1, 1).requires_grad_(True)
+        expert_hidden = self.model.expert_forward_with_action_grad(
+            prefix_embs.detach(), prefix_pad_masks, prefix_att_masks,
+            actions_for_q,
+        )
+        q_values = self.model.compute_q_values(expert_hidden, use_target=False)
+        q_scalar = q_values.mean(dim=0).mean()  # scalar Q averaged over critics and batch
+        dq_da = torch.autograd.grad(q_scalar, actions_for_q)[0]  # (B, chunk_size, action_dim)
+        # Surrogate: dq_da already contains 1/B from q_scalar's batch mean,
+        # so .sum() (not .sum()/B) gives the correct -(1/B)*Σ_b ∂Q_b/∂θ gradient.
+        q_loss = -(onestep_actions[:, :, :actual_action_dim] * dq_da[:, :, :actual_action_dim].detach()).sum()
+
+        # --- Total actor loss ---
+        alpha = self.config.qc_alpha
+        total_loss = bc_flow_loss + alpha * distill_loss + q_loss
+
+        loss_dict = {
+            "loss": total_loss.item(),
+            "bc_flow_loss": bc_flow_loss.item(),
+            "distill_loss": distill_loss.item(),
+            "q_loss": q_loss.item(),
+            "q_actor_mean": q_scalar.item(),
+        }
+        return total_loss, loss_dict
+
+    def forward_distill(
+        self, batch: dict[str, Tensor],
+    ) -> tuple[Tensor, dict]:
+        """BC flow loss (backbone) + distillation loss (onestep_head), no Q-learning.
+
+        total_loss = bc_flow_loss + alpha * distill_loss
+
+        Returns:
+            total_loss: scalar
+            loss_dict: diagnostic info
+        """
+        if self.config.adapt_to_pi_aloha:
+            batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
+            batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
+
+        images, img_masks = self.prepare_images(batch)
+        state = self.prepare_state(batch)
+        lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
+        lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+        actions = self.prepare_action(batch)
+        actions_is_pad = batch["action_is_pad"]
+
+        losses, fwd_info = self.model.forward(
+            images, img_masks, lang_tokens, lang_masks, state, actions
+        )
+
+        if actions_is_pad is not None:
+            in_episode_bound = ~actions_is_pad
+            losses = losses * in_episode_bound.unsqueeze(-1)
+
+        losses = losses[:, :, :self.config.max_action_dim]
+        bc_flow_loss = losses.mean()
+
+        prefix_embs = fwd_info["prefix_embs"]
+        prefix_pad_masks = fwd_info["prefix_pad_masks"]
+        prefix_att_masks = fwd_info["prefix_att_masks"]
+        prefix_out = fwd_info["prefix_out"]
+
+        B = actions.shape[0]
+        device = actions.device
+        distill_noise = self.model.sample_noise(
+            (B, self.config.chunk_size, self.config.max_action_dim), device
+        )
+
+        flow_actions = self.model.compute_flow_actions(
+            prefix_embs.detach(), prefix_pad_masks, prefix_att_masks, distill_noise
+        )
+
+        onestep_actions = self.model.sample_onestep_actions(
+            prefix_embs.detach(), prefix_pad_masks, prefix_att_masks, noise=distill_noise
+        )
+        actual_action_dim = self.config.action_feature.shape[0]
+        distill_loss = F.mse_loss(
+            onestep_actions[:, :, :actual_action_dim],
+            flow_actions[:, :, :actual_action_dim],
+            reduction="mean",
+        )
+
+        alpha = self.config.qc_alpha
+        total_loss = bc_flow_loss + alpha * distill_loss
+
+        loss_dict = {
+            "loss": total_loss.item(),
+            "bc_flow_loss": bc_flow_loss.item(),
+            "distill_loss": distill_loss.item(),
+        }
+        return total_loss, loss_dict
+
     def forward_critic(
         self,
         batch: dict[str, Tensor],
         next_batch: dict[str, Tensor],
         rewards: Tensor,
-        dones: Tensor,
+        terminateds: Tensor,
+        next_obs_is_pad: Tensor | None = None,
     ) -> tuple[Tensor, dict]:
         """Compute QC-FQL critic TD loss.
 
@@ -413,8 +635,18 @@ class SmolVLAQLPolicy(PreTrainedPolicy):
         Args:
             batch: Current observation batch (standard lerobot format with actions).
             next_batch: Next observation batch (same format, actions not required).
-            rewards: Sum of rewards over the action chunk, shape (B,).
-            dones: Terminal flags, shape (B,).
+            rewards: Cumulative discounted rewards over the action chunk, shape (B,).
+            terminateds: Whether a true terminal state occurred in the chunk, shape (B,).
+                Only uses terminated (not truncated). Truncated episodes still bootstrap.
+            next_obs_is_pad: (B,) bool from prepare_qc_batch.
+                True when abs_idx + chunk_size >= ep_end, meaning the next observation
+                is clamped to the episode's last frame (garbage for TD bootstrap).
+                Corresponding per-sample critic loss is zeroed out.
+
+                对比 ACFQL 的两层保护：
+                - masks[..., -1]: 1 - terminated，用于 TD bootstrap → 我们用 terminateds
+                - valid[..., -1]: 1 - done（检测跨 episode）→ LeRobot 无跨 episode 问题，
+                  但需检测 next obs 被 padded 的情况 → 用 next_obs_is_pad
 
         Returns:
             critic_loss: Scalar loss for updating value_heads.
@@ -434,7 +666,7 @@ class SmolVLAQLPolicy(PreTrainedPolicy):
         expert_hidden = self.model.expert_forward_for_value(prefix[0], prefix[1], prefix[2], actions)
         q_values = self.model.compute_q_values(expert_hidden, use_target=False)  # (num_critics, B)
 
-        # --- Target Q(s', a') via Best-of-N ---
+        # --- Target Q(s', a') ---
         with torch.no_grad():
             if self.config.adapt_to_pi_aloha:
                 next_batch[OBS_STATE] = self._pi_aloha_decode_state(next_batch[OBS_STATE])
@@ -448,20 +680,50 @@ class SmolVLAQLPolicy(PreTrainedPolicy):
                 f"{OBS_LANGUAGE_ATTENTION_MASK}", lang_masks
             )
 
-            best_actions, target_q_values = self.model.sample_best_of_n_with_target_q(
-                next_images, next_img_masks, next_lang_tokens, next_lang_masks, next_state
-            )
-            # target_q_values: (B,) — aggregated target Q for best actions
+            if self.config.qc_actor_type == "distill-ddpg":
+                next_prefix_embs, next_prefix_pad_masks, next_prefix_att_masks = (
+                    self.model.embed_prefix(
+                        next_images, next_img_masks, next_lang_tokens, next_lang_masks,
+                        state=next_state,
+                    )
+                )
+                next_actions = self.model.sample_onestep_actions(
+                    next_prefix_embs, next_prefix_pad_masks, next_prefix_att_masks
+                )
+                expert_hidden_next = self.model.expert_forward_for_value(
+                    next_prefix_embs, next_prefix_pad_masks, next_prefix_att_masks, next_actions
+                )
+                target_q_all = self.model.compute_q_values(expert_hidden_next, use_target=True)
+                if self.config.qc_q_agg == "min":
+                    target_q_values = target_q_all.min(dim=0).values
+                else:
+                    target_q_values = target_q_all.mean(dim=0)
+            else:
+                # Best-of-N: sample N action chunks, pick the best by Q-value
+                _best_actions, target_q_values = self.model.sample_best_of_n_with_target_q(
+                    next_images, next_img_masks, next_lang_tokens, next_lang_masks, next_state
+                )
 
-            # TD target: r + γ^h * (1 - done) * Q_target(s', a')
+            # TD target: r + γ^h * (1 - terminated) * Q_target(s', a')
             discount = self.config.qc_discount ** self.config.chunk_size
-            td_target = rewards + discount * (1.0 - dones.float()) * target_q_values
+            td_target = rewards + discount * (1.0 - terminateds.float()) * target_q_values
 
-        # --- Critic loss: mean MSE across ensemble ---
+        # --- Critic loss: per-sample MSE, masked by next_obs_is_pad ---
+        # When next obs is padded (clamp to episode end), the TD target bootstraps
+        # from garbage observation → zero out these samples.
+        # Cf. ACFQL: critic_loss = ((q - target_q)^2 * valid[..., -1]).mean()
+        #   where valid[..., -1] detects cross-episode data (same purpose, different mechanism).
+        if next_obs_is_pad is not None:
+            critic_valid = (~next_obs_is_pad).float()
+        else:
+            raise ValueError("next_obs_is_pad is required for critic loss")
+
+
         loss_dict = {}
         critic_losses = []
         for i, q_i in enumerate(q_values):
-            loss_i = F.mse_loss(q_i, td_target)
+            per_sample_loss = (q_i - td_target).pow(2) * critic_valid
+            loss_i = per_sample_loss.mean()
             critic_losses.append(loss_i)
             loss_dict[f"critic_q{i}_loss"] = loss_i.item()
             loss_dict[f"critic_q{i}_mean"] = q_i.mean().item()
@@ -469,6 +731,7 @@ class SmolVLAQLPolicy(PreTrainedPolicy):
         critic_loss = sum(critic_losses) / len(critic_losses)
         loss_dict["critic_loss"] = critic_loss.item()
         loss_dict["td_target_mean"] = td_target.mean().item()
+        loss_dict["critic_valid_ratio"] = critic_valid.mean().item()
 
         return critic_loss, loss_dict
 
@@ -635,6 +898,14 @@ class VLAFlowMatching(nn.Module):
         for p in self.target_value_heads.parameters():
             p.requires_grad = False
 
+        # ---- One-Step Action Head (distill-ddpg) ----
+        if config.qc_actor_type == "distill-ddpg":
+            self.onestep_head = OnestepActionHead(
+                input_dim=expert_hidden_size,
+                output_dim=config.max_action_dim,
+                hidden_dims=config.qc_onestep_hidden_dims,
+            )
+
         self.set_requires_grad()
         self.fake_image_token = self.vlm_with_expert.processor.tokenizer.fake_image_token_id
         self.global_image_token = self.vlm_with_expert.processor.tokenizer.global_image_token_id
@@ -669,6 +940,36 @@ class VLAFlowMatching(nn.Module):
         time_beta = beta_dist.sample((bsize,)).to(device=device, dtype=torch.float32)
         time = time_beta * 0.999 + 0.001
         return time
+
+    # ==================== One-Step Policy Helpers ====================
+
+    def sample_onestep_actions(
+        self,
+        prefix_embs: Tensor,
+        prefix_pad_masks: Tensor,
+        prefix_att_masks: Tensor,
+        noise: Tensor | None = None,
+    ) -> Tensor:
+        """Compute noise_hidden via expert, then predict actions with per-timestep MLP.
+
+        Args:
+            prefix_embs: (B, prefix_len, vlm_hidden) from embed_prefix.
+            prefix_pad_masks: (B, prefix_len)
+            prefix_att_masks: (B, prefix_len)
+            noise: (B, chunk_size, max_action_dim). Sampled if None.
+        Returns:
+            (B, chunk_size, max_action_dim) action chunk.
+        """
+        B = prefix_embs.shape[0]
+        device = prefix_embs.device
+        if noise is None:
+            noise = self.sample_noise(
+                (B, self.config.chunk_size, self.config.max_action_dim), device
+            )
+        noise_hidden = self.compute_noise_hidden(
+            prefix_embs, prefix_pad_masks, prefix_att_masks, noise
+        )
+        return self.onestep_head(noise_hidden)
 
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
@@ -804,8 +1105,15 @@ class VLAFlowMatching(nn.Module):
 
     def forward(
         self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
-    ) -> Tensor:
-        """Flow matching training forward (unchanged from base SmolVLA)."""
+    ) -> tuple[Tensor, dict]:
+        """Flow matching training forward.
+
+        Returns:
+            losses: (B, chunk_size, action_dim) per-element MSE losses.
+            info: dict with cached intermediate tensors for forward_actor reuse:
+                - prefix_embs, prefix_pad_masks, prefix_att_masks
+                - prefix_out (from VLM, for one-step head)
+        """
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
 
@@ -825,7 +1133,7 @@ class VLAFlowMatching(nn.Module):
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
-        (_, suffix_out), _ = self.vlm_with_expert.forward(
+        (prefix_out, suffix_out), _ = self.vlm_with_expert.forward(
             attention_mask=att_2d_masks,
             position_ids=position_ids,
             past_key_values=None,
@@ -837,7 +1145,14 @@ class VLAFlowMatching(nn.Module):
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
         losses = F.mse_loss(u_t, v_t, reduction="none")
-        return losses
+
+        fwd_info = {
+            "prefix_embs": prefix_embs,
+            "prefix_pad_masks": prefix_pad_masks,
+            "prefix_att_masks": prefix_att_masks,
+            "prefix_out": prefix_out,
+        }
+        return losses, fwd_info
 
     # ==================== Inference ====================
 
@@ -909,6 +1224,72 @@ class VLAFlowMatching(nn.Module):
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
 
+        return x_t
+
+    def sample_actions_onestep(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        noise=None,
+    ) -> Tensor:
+        """One-step inference: embed_prefix → noise_hidden via expert → MLP → actions."""
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, state=state
+        )
+        return self.sample_onestep_actions(
+            prefix_embs, prefix_pad_masks, prefix_att_masks, noise=noise
+        )
+
+    @torch.no_grad()
+    def compute_flow_actions(
+        self,
+        prefix_embs: Tensor,
+        prefix_pad_masks: Tensor,
+        prefix_att_masks: Tensor,
+        noise: Tensor,
+    ) -> Tensor:
+        """Run full iterative flow denoising from precomputed prefix to get clean actions.
+
+        Used as the distillation target for the one-step head (called under no_grad).
+
+        Args:
+            prefix_embs: (B, prefix_len, vlm_hidden) precomputed.
+            prefix_pad_masks: (B, prefix_len)
+            prefix_att_masks: (B, prefix_len)
+            noise: (B, chunk_size, max_action_dim) starting noise.
+        Returns:
+            (B, chunk_size, max_action_dim) denoised actions.
+        """
+        bsize = noise.shape[0]
+        device = noise.device
+
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        _, past_key_values = self.vlm_with_expert.forward(
+            attention_mask=prefix_att_2d_masks,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=self.config.use_cache,
+            fill_kv_cache=True,
+        )
+
+        num_steps = self.config.num_steps
+        dt = -1.0 / num_steps
+        x_t = noise
+        for step in range(num_steps):
+            t = 1.0 + step * dt
+            time_tensor = torch.tensor(t, dtype=torch.float32, device=device).expand(bsize)
+            v_t = self.denoise_step(
+                x_t=x_t,
+                prefix_pad_masks=prefix_pad_masks,
+                past_key_values=past_key_values,
+                timestep=time_tensor,
+            )
+            x_t = x_t + dt * v_t
         return x_t
 
     def denoise_step(
@@ -997,6 +1378,45 @@ class VLAFlowMatching(nn.Module):
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         return suffix_out  # detached due to no_grad context
+
+    def expert_forward_with_action_grad(
+        self,
+        prefix_embs: Tensor,
+        prefix_pad_masks: Tensor,
+        prefix_att_masks: Tensor,
+        clean_actions: Tensor,
+    ) -> Tensor:
+        """Like expert_forward_for_value but allows gradients through clean_actions.
+
+        Used by forward_actor's q_loss: gradient flows from Q → value_heads →
+        expert_hidden → expert layers → embed_suffix → action_in_proj → clean_actions
+        → onestep_head. Prefix is detached so VLM/state_proj get no gradient from this path.
+        """
+        bsize = clean_actions.shape[0]
+        device = clean_actions.device
+
+        prefix_embs = prefix_embs.detach()
+
+        timestep = torch.zeros(bsize, device=device, dtype=torch.float32)
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(clean_actions, timestep)
+
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+
+        (_, suffix_out), _ = self.vlm_with_expert.forward(
+            attention_mask=att_2d_masks,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, suffix_embs],
+            use_cache=False,
+            fill_kv_cache=False,
+        )
+
+        suffix_out = suffix_out[:, -self.config.chunk_size :]
+        suffix_out = suffix_out.to(dtype=torch.float32)
+        return suffix_out
 
     def compute_q_values(self, expert_hidden_states: Tensor, use_target: bool = False) -> Tensor:
         """Compute Q-values from expert hidden states using the value head ensemble.
@@ -1240,6 +1660,55 @@ class VLAFlowMatching(nn.Module):
 
         timestep = torch.zeros(bsize, device=device, dtype=torch.float32)
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(clean_actions, timestep)
+
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+
+        (_, suffix_out), _ = self.vlm_with_expert.forward(
+            attention_mask=att_2d_masks,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, suffix_embs],
+            use_cache=False,
+            fill_kv_cache=False,
+        )
+        suffix_out = suffix_out[:, -self.config.chunk_size :]
+        return suffix_out.to(dtype=torch.float32)
+
+    @torch.no_grad()
+    def compute_noise_hidden(
+        self,
+        prefix_embs: Tensor,
+        prefix_pad_masks: Tensor,
+        prefix_att_masks: Tensor,
+        noise: Tensor,
+    ) -> Tensor:
+        """Expert forward on noise at t=1, returning detached expert hidden states.
+
+        The noise is embedded as if it were x_t at timestep=1 (pure noise), then
+        processed by the expert with cross-attention to the observation prefix.
+        The resulting hidden states carry rich, observation-conditioned information
+        about the noise — much richer than a single state_token.
+
+        All inputs are detached internally; no gradient flows back to the backbone.
+
+        Args:
+            prefix_embs: (B, prefix_len, vlm_hidden) from embed_prefix.
+            prefix_pad_masks: (B, prefix_len)
+            prefix_att_masks: (B, prefix_len)
+            noise: (B, chunk_size, max_action_dim)
+        Returns:
+            (B, chunk_size, expert_hidden_size) — detached expert hidden states.
+        """
+        bsize = noise.shape[0]
+        device = noise.device
+
+        prefix_embs = prefix_embs.detach()
+
+        timestep = torch.ones(bsize, device=device, dtype=torch.float32)
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(noise, timestep)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
