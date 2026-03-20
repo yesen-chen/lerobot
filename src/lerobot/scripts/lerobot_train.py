@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -510,6 +508,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             if is_main_process:
                 step_id = get_step_identifier(step, cfg.steps)
                 logging.info(f"Eval policy at step {step}")
+                # Use the first task from the dataset as fallback for envs
+                # that don't expose language instructions (e.g. ALOHA).
+                _fallback = None
+                if hasattr(dataset, "meta") and dataset.meta.tasks is not None and len(dataset.meta.tasks) > 0:
+                    _fallback = dataset.meta.tasks.index[0]
+                logging.info(f"[Eval] fallback_task = {repr(_fallback)}")
+
                 with torch.no_grad(), accelerator.autocast():
                     eval_info = eval_policy_all(
                         envs=eval_env,  # dict[suite][task_id] -> vec_env
@@ -523,6 +528,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                         max_episodes_rendered=4,
                         start_seed=cfg.seed,
                         max_parallel_tasks=cfg.env.max_parallel_tasks,
+                        fallback_task=_fallback,
                     )
                 # overall metrics (suite-agnostic)
                 aggregated = eval_info["overall"]

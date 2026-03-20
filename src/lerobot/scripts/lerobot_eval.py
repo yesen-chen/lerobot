@@ -102,6 +102,7 @@ def rollout(
     seeds: list[int] | None = None,
     return_observations: bool = False,
     render_callback: Callable[[gym.vector.VectorEnv], None] | None = None,
+    fallback_task: str | None = None,
 ) -> dict:
     """Run a batched policy rollout once through a batch of environments.
 
@@ -159,6 +160,7 @@ def rollout(
         leave=False,
     )
     check_env_attributes_and_types(env)
+    _logged_task = False
     while not np.all(done) and step < max_steps:
         # Numpy array to tensor and changing dictionary keys to LeRobot policy format.
         observation = preprocess_observation(observation)
@@ -167,7 +169,10 @@ def rollout(
 
         # Infer "task" from attributes of environments.
         # TODO: works with SyncVectorEnv but not AsyncVectorEnv
-        observation = add_envs_task(env, observation)
+        observation = add_envs_task(env, observation, fallback_task=fallback_task)
+        if not _logged_task:
+            logging.info(f"[rollout] fallback_task={repr(fallback_task)}, actual task={repr(observation.get('task'))}")
+            _logged_task = True
 
         # Apply environment-specific preprocessing (e.g., LiberoProcessorStep for LIBERO)
         observation = env_preprocessor(observation)
@@ -189,8 +194,8 @@ def rollout(
         observation, reward, terminated, truncated, info = env.step(action_numpy)
         if render_callback is not None:
             render_callback(env)
-        if reward[0]>0:
-            print("OK")
+        # if reward[0]>0:
+        #     print("OK")
 
         # VectorEnv stores is_success in `info["final_info"][env_index]["is_success"]`. "final_info" isn't
         # available if none of the envs finished.
@@ -261,6 +266,7 @@ def eval_policy(
     videos_dir: Path | None = None,
     return_episode_data: bool = False,
     start_seed: int | None = None,
+    fallback_task: str | None = None,
 ) -> dict:
     """
     Args:
@@ -348,6 +354,7 @@ def eval_policy(
             seeds=list(seeds) if seeds else None,
             return_observations=return_episode_data,
             render_callback=render_frame if max_episodes_rendered > 0 else None,
+            fallback_task=fallback_task,
         )
 
         # Figure out where in each rollout sequence the first done condition was encountered (results after
@@ -606,6 +613,28 @@ def eval_main(cfg: EvalPipelineConfig):
                 f"Check --rename_map or the saved preprocessor rename_map."
             )
 
+    # Extract fallback task from the training dataset for envs without
+    # language instructions (e.g. ALOHA).  Read the train_config.json
+    # saved alongside the checkpoint to find the dataset, then load
+    # its tasks.parquet.
+    _fallback_task = None
+    if cfg.policy.pretrained_path:
+        try:
+            train_cfg_path = Path(cfg.policy.pretrained_path) / "train_config.json"
+            if train_cfg_path.exists():
+                with open(train_cfg_path) as _f:
+                    _train_cfg = json.load(_f)
+                _repo_id = _train_cfg.get("dataset", {}).get("repo_id")
+                _ds_root = _train_cfg.get("dataset", {}).get("root")
+                if _repo_id:
+                    from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+                    _meta = LeRobotDatasetMetadata(_repo_id, root=_ds_root)
+                    if _meta.tasks is not None and len(_meta.tasks) > 0:
+                        _fallback_task = _meta.tasks.index[0]
+                        logging.info(f"[Eval] Loaded fallback_task from dataset: '{_fallback_task}'")
+        except Exception as e:
+            logging.warning(f"[Eval] Could not load fallback task from checkpoint: {e}")
+
     with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
         info = eval_policy_all(
             envs=envs,
@@ -619,6 +648,7 @@ def eval_main(cfg: EvalPipelineConfig):
             videos_dir=Path(cfg.output_dir) / "videos",
             start_seed=cfg.seed,
             max_parallel_tasks=cfg.env.max_parallel_tasks,
+            fallback_task=_fallback_task,
         )
         print("Overall Aggregated Metrics:")
         print(info["overall"])
@@ -661,6 +691,7 @@ def eval_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    fallback_task: str | None = None,
 ) -> TaskMetrics:
     """Evaluates one task_id of one suite using the provided vec env."""
 
@@ -678,6 +709,7 @@ def eval_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        fallback_task=fallback_task,
     )
 
     per_episode = task_result["per_episode"]
@@ -704,6 +736,7 @@ def run_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    fallback_task: str | None = None,
 ):
     """
     Run eval_one for a single (task_group, task_id, env).
@@ -728,6 +761,7 @@ def run_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        fallback_task=fallback_task,
     )
     # ensure we always provide video_paths key to simplify accumulation
     if max_episodes_rendered > 0:
@@ -749,6 +783,7 @@ def eval_policy_all(
     return_episode_data: bool = False,
     start_seed: int | None = None,
     max_parallel_tasks: int = 1,
+    fallback_task: str | None = None,
 ) -> dict:
     """
     Evaluate a nested `envs` dict: {task_group: {task_id: vec_env}}.
@@ -804,6 +839,7 @@ def eval_policy_all(
         videos_dir=videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        fallback_task=fallback_task,
     )
 
     if max_parallel_tasks <= 1:

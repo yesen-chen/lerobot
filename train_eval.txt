@@ -63,7 +63,31 @@ lerobot-train \
 
 lerobot-train     --dataset.repo_id=lerobot/aloha_sim_transfer_cube_human     --policy.type=mlp     --policy.chunk_size=50     --policy.n_action_steps=50     --policy.loss_type=l1     --policy.do_mask_loss_for_padding=true     --steps=100000     --batch_size=64     --eval_freq=10000     --save_freq=20000     --dataset.image_transforms.enable=false     --policy.device=cuda     --policy.use_amp=true     --policy.push_to_hub=false     --policy.pretrained_backbone_weights=ResNet18_Weights.IMAGENET1K_V1     --policy.use_group_norm=false     --policy.backbone_lr_scale=0.1     --wandb.enable=true     --wandb.project=aloha_mlp     --env.type=aloha     --env.task=AlohaTransferCube-v0
 
-
+lerobot-train \
+    --dataset.repo_id=lerobot/aloha_sim_transfer_cube_scripted \
+    --policy.type=smolvla \
+    --policy.load_vlm_weights=true \
+    --policy.vlm_model_name=HuggingFaceTB/SmolVLM2-500M-Video-Instruct \
+    --policy.chunk_size=50 \
+    --policy.n_action_steps=50 \
+    --steps=20000 \
+    --batch_size=64 \
+    --eval_freq=2500 \
+    --save_freq=10000 \
+    --env.type=aloha \
+    --env.task=AlohaTransferCube-v0 \
+    --eval.batch_size=5 \
+    --eval.n_episodes=20 \
+    --wandb.enable=true \
+    --wandb.project=aloha_smolvla \
+    --policy.push_to_hub=false \
+    --output_dir=./libero_ckpt/smolvla_aloha_v3 \
+    --policy.normalization_mapping='{"VISUAL": "IDENTITY", "STATE": "MIN_MAX", "ACTION": "MIN_MAX"}' \
+    --policy.optimizer_weight_decay=1e-4 \
+    --policy.scheduler_decay_steps=10000 \
+    --policy.scheduler_warmup_steps=500 \
+    --dataset.image_transforms.center_crop_to_square=true \
+    --policy.freeze_vision_encoder=false
 
 
 lerobot-train --dataset.repo_id=dksen/pick_doll_place_merged_09_13 --dataset.root=E:\cys\dataset\pick_doll_place_merged_09_13 --policy.type=flow_matching --steps=100000 --batch_size=64 --eval_freq=10000 --save_freq=50000 --dataset.image_transforms.enable=false --policy.device=cuda --policy.use_amp=true --policy.push_to_hub=false --policy.pretrained_backbone_weights=ResNet18_Weights.IMAGENET1K_V1 --policy.use_group_norm=false --policy.backbone_lr_scale=0.1 --wandb.enable=false --wandb.project=pick_doll_place --dataset.image_transforms.resize_to=[240,320]

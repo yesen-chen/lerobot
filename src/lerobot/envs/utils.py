@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import importlib.util
+import logging
 import os
 import warnings
 from collections.abc import Mapping, Sequence
@@ -153,8 +154,23 @@ def check_env_attributes_and_types(env: gym.vector.VectorEnv) -> None:
             )
 
 
-def add_envs_task(env: gym.vector.VectorEnv, observation: RobotObservation) -> RobotObservation:
-    """Adds task feature to the observation dict with respect to the first environment attribute."""
+def add_envs_task(
+    env: gym.vector.VectorEnv,
+    observation: RobotObservation,
+    fallback_task: str | None = None,
+) -> RobotObservation:
+    """Adds task feature to the observation dict with respect to the first environment attribute.
+
+    Args:
+        env: The vectorized environment.
+        observation: The observation dictionary to augment.
+        fallback_task: If the environment does not expose a task description,
+            use this string instead of an empty string.  This is important for
+            VLA policies (e.g. SmolVLA) that were trained with language
+            conditioning — feeding an empty string at eval time leads to
+            out-of-distribution behaviour.
+    """
+    task_set = False
     if hasattr(env.envs[0], "task_description"):
         task_result = env.call("task_description")
 
@@ -167,6 +183,7 @@ def add_envs_task(env: gym.vector.VectorEnv, observation: RobotObservation) -> R
             raise TypeError("All items in task_description result must be strings")
 
         observation["task"] = task_result
+        task_set = True
     elif hasattr(env.envs[0], "task"):
         task_result = env.call("task")
 
@@ -179,9 +196,22 @@ def add_envs_task(env: gym.vector.VectorEnv, observation: RobotObservation) -> R
             raise TypeError("All items in task result must be strings")
 
         observation["task"] = task_result
-    else:  #  For envs without language instructions, e.g. aloha transfer cube and etc.
+        task_set = True
+
+    if not task_set:
         num_envs = observation[list(observation.keys())[0]].shape[0]
-        observation["task"] = ["" for _ in range(num_envs)]
+        fill = fallback_task if fallback_task else ""
+        observation["task"] = [fill for _ in range(num_envs)]
+
+    # Override with fallback if the env returned empty/whitespace-only tasks
+    if fallback_task and "task" in observation:
+        tasks = observation["task"]
+        if isinstance(tasks, list) and all(not t.strip() for t in tasks):
+            logging.warning(
+                f"[add_envs_task] Env returned empty task strings, overriding with fallback: '{fallback_task[:80]}...'"
+            )
+            observation["task"] = [fallback_task for _ in range(len(tasks))]
+
     return observation
 
 
