@@ -385,8 +385,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
             losses = losses * in_episode_bound.unsqueeze(-1)
             loss_dict["losses_after_in_ep_bound"] = losses.clone().mean().item()
 
-        # Remove padding
-        losses = losses[:, :, : self.config.max_action_dim]
+        # Only real action dimensions; padded tail dims are not supervised (same as pi0/pi0.5).
+        original_action_dim = self.config.action_feature.shape[0]
+        losses = losses[:, :, :original_action_dim]
         loss_dict["losses_after_rm_padding"] = losses.clone().mean().item()
 
         if reduction == "none":
