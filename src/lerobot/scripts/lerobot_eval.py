@@ -574,9 +574,32 @@ def eval_main(cfg: EvalPipelineConfig):
         preprocessor_overrides=preprocessor_overrides,
     )
     print("preprocessor:", preprocessor)
+
+    # Recover image_transforms from train_config.json for eval consistency
+    _eval_image_transforms = None
+    if cfg.policy and cfg.policy.pretrained_path:
+        try:
+            _tcfg_path = Path(cfg.policy.pretrained_path) / "train_config.json"
+            if _tcfg_path.exists():
+                with open(_tcfg_path) as _f:
+                    _tcfg = json.load(_f)
+                _it = _tcfg.get("dataset", {}).get("image_transforms", {})
+                if _it.get("center_crop_to_square") or _it.get("resize_to"):
+                    from lerobot.datasets.transforms import ImageTransformsConfig
+                    _eval_image_transforms = ImageTransformsConfig()
+                    _eval_image_transforms.center_crop_to_square = _it.get("center_crop_to_square", False)
+                    _eval_image_transforms.resize_to = _it.get("resize_to")
+                    logging.info(
+                        f"[Eval] Recovered image_transforms from checkpoint: "
+                        f"center_crop={_eval_image_transforms.center_crop_to_square}, "
+                        f"resize_to={_eval_image_transforms.resize_to}"
+                    )
+        except Exception as e:
+            logging.warning(f"[Eval] Could not recover image_transforms: {e}")
+
     # Create environment-specific preprocessor and postprocessor (e.g., for LIBERO environments)
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(
-        env_cfg=cfg.env, policy_cfg=cfg.policy, image_transforms=None
+        env_cfg=cfg.env, policy_cfg=cfg.policy, image_transforms=_eval_image_transforms
     )
 
     # Verify that env image keys (after rename) match the policy's expected image keys.
