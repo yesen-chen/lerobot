@@ -403,23 +403,26 @@ class RLTActorEvalWrapper(nn.Module):
     """Thin wrapper that gives RLTPolicy a select_action / reset interface
     compatible with the LeRobot eval rollout loop.
 
-    The flow for each action chunk:
-      1. VLA preprocesses the observation (images, state, language).
-      2. embed_image  ->  encoder  ->  z_rl
-      3. VLA sample_actions  ->  ref_action, noise
-      4. Actor(z_rl, state, ref_action[:C], noise[:C])  ->  predicted actions (B, C, action_dim)
-      5. Actions are queued; one is popped per step.
+    Two inference modes:
+      "with_vla"   - Run full VLA to get ref_action + noise, then actor edits them.
+                     Slower but leverages VLA guidance. (default)
+      "independent" - ref_action = zeros, noise = random. Actor generates actions
+                     purely from z_rl + state, no VLA forward needed.
+                     Much faster, tests the actor's standalone capability.
     """
 
-    def __init__(self, rlt_policy: RLTPolicy):
+    MODES = ("with_vla", "independent")
+
+    def __init__(self, rlt_policy: RLTPolicy, mode: str = "with_vla"):
         super().__init__()
+        assert mode in self.MODES, f"mode must be one of {self.MODES}, got '{mode}'"
         self.rlt_policy = rlt_policy
         self.vla = rlt_policy.vla_policy
+        self.mode = mode
         self.n_action_steps = rlt_policy.config.actor_chunk_size
         self._queues: dict[str, deque] = {}
         self.reset()
 
-        # Satisfy isinstance(self, PreTrainedPolicy) check in eval_policy
         from lerobot.policies.pretrained import PreTrainedPolicy
         PreTrainedPolicy.register(type(self))
 
@@ -439,32 +442,37 @@ class RLTActorEvalWrapper(nn.Module):
 
         if len(self._queues[ACTION]) == 0:
             actions = self._get_action_chunk(batch)
-            # (B, C, action_dim) -> queue as (C, B, action_dim)
             self._queues[ACTION].extend(actions.transpose(0, 1)[:self.n_action_steps])
 
         return self._queues[ACTION].popleft()
 
     def _get_action_chunk(self, batch) -> torch.Tensor:
-        """Run full actor inference to produce an action chunk."""
+        """Run actor inference to produce an action chunk."""
         C = self.rlt_policy.config.actor_chunk_size
+        action_dim = self.rlt_policy.action_dim
 
-        # Prepare inputs using VLA's preprocessing
         images, img_masks = self.vla.prepare_images(batch)
         state_padded = self.vla.prepare_state(batch)
-        lang_tokens = batch[OBS_LANGUAGE_TOKENS]
-        lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
 
-        # RL token
+        # RL token (always needed)
         image_embs = self.rlt_policy.extract_image_embeddings(images)
         z_rl = self.rlt_policy.encoder_decoder.encode(image_embs)
 
-        # VLA reference actions + noise
-        ref_actions, noise = self.rlt_policy.get_vla_reference_actions(
-            images, img_masks, lang_tokens, lang_masks, state_padded,
-        )
-        ref_sliced = ref_actions[:, :C, :]
-        noise_sliced = noise[:, :C, :]
+        B = z_rl.shape[0]
+        device = z_rl.device
 
-        # Actor forward (eval mode, no ref_action dropout)
+        if self.mode == "with_vla":
+            lang_tokens = batch[OBS_LANGUAGE_TOKENS]
+            lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
+            ref_actions, noise = self.rlt_policy.get_vla_reference_actions(
+                images, img_masks, lang_tokens, lang_masks, state_padded,
+            )
+            ref_sliced = ref_actions[:, :C, :]
+            noise_sliced = noise[:, :C, :]
+        else:
+            # Independent mode: zero ref_action (mimics dropout=1.0), random noise
+            ref_sliced = torch.zeros(B, C, action_dim, device=device)
+            noise_sliced = torch.randn(B, C, action_dim, device=device)
+
         predicted = self.rlt_policy.actor(z_rl, state_padded, ref_sliced, noise_sliced)
         return predicted

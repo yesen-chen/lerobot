@@ -222,62 +222,71 @@ def run_actor_vs_vla_eval(
         image_transforms=cfg.dataset.image_transforms,
     )
 
-    # ── Eval Actor ──
-    logging.info(colored(f"[Eval step {step}] Running RLT actor eval...", "cyan", attrs=["bold"]))
-    actor_wrapper = RLTActorEvalWrapper(rlt_policy)
-    actor_wrapper.eval()
+    eval_common_kwargs = dict(
+        env_preprocessor=env_preprocessor,
+        env_postprocessor=env_postprocessor,
+        preprocessor=preprocessor,
+        postprocessor=postprocessor,
+        n_episodes=n_episodes,
+        max_episodes_rendered=min(4, n_episodes),
+        start_seed=cfg.seed,
+        max_parallel_tasks=cfg.env.max_parallel_tasks,
+        fallback_task=fallback_task,
+    )
+
+    # ── Eval Actor (with_vla mode) ──
+    logging.info(colored(f"[Eval step {step}] Actor (with_vla)...", "cyan", attrs=["bold"]))
+    actor_vla_wrapper = RLTActorEvalWrapper(rlt_policy, mode="with_vla")
+    actor_vla_wrapper.eval()
     with torch.no_grad():
-        actor_results = eval_policy_all(
-            envs=eval_env,
-            policy=actor_wrapper,
-            env_preprocessor=env_preprocessor,
-            env_postprocessor=env_postprocessor,
-            preprocessor=preprocessor,
-            postprocessor=postprocessor,
-            n_episodes=n_episodes,
-            videos_dir=output_dir / "eval" / f"actor_step{step}",
-            max_episodes_rendered=min(4, n_episodes),
-            start_seed=cfg.seed,
-            max_parallel_tasks=cfg.env.max_parallel_tasks,
-            fallback_task=fallback_task,
+        actor_vla_results = eval_policy_all(
+            envs=eval_env, policy=actor_vla_wrapper,
+            videos_dir=output_dir / "eval" / f"actor_with_vla_step{step}",
+            **eval_common_kwargs,
         )
 
-    # ── Eval VLA ──
-    logging.info(colored(f"[Eval step {step}] Running VLA baseline eval...", "cyan", attrs=["bold"]))
+    # ── Eval Actor (independent mode) ──
+    logging.info(colored(f"[Eval step {step}] Actor (independent)...", "cyan", attrs=["bold"]))
+    actor_ind_wrapper = RLTActorEvalWrapper(rlt_policy, mode="independent")
+    actor_ind_wrapper.eval()
+    with torch.no_grad():
+        actor_ind_results = eval_policy_all(
+            envs=eval_env, policy=actor_ind_wrapper,
+            videos_dir=output_dir / "eval" / f"actor_independent_step{step}",
+            **eval_common_kwargs,
+        )
+
+    # ── Eval VLA baseline ──
+    logging.info(colored(f"[Eval step {step}] VLA baseline...", "cyan", attrs=["bold"]))
     rlt_policy.vla_policy.eval()
     with torch.no_grad():
         vla_results = eval_policy_all(
-            envs=eval_env,
-            policy=rlt_policy.vla_policy,
-            env_preprocessor=env_preprocessor,
-            env_postprocessor=env_postprocessor,
-            preprocessor=preprocessor,
-            postprocessor=postprocessor,
-            n_episodes=n_episodes,
+            envs=eval_env, policy=rlt_policy.vla_policy,
             videos_dir=output_dir / "eval" / f"vla_step{step}",
-            max_episodes_rendered=min(4, n_episodes),
-            start_seed=cfg.seed,
-            max_parallel_tasks=cfg.env.max_parallel_tasks,
-            fallback_task=fallback_task,
+            **eval_common_kwargs,
         )
 
-    actor_agg = actor_results["overall"]
-    vla_agg = vla_results["overall"]
+    a_vla = actor_vla_results["overall"]
+    a_ind = actor_ind_results["overall"]
+    vla = vla_results["overall"]
 
     logging.info(
         colored(f"[Eval step {step}]", "cyan", attrs=["bold"])
-        + f" Actor: success={actor_agg['pc_success']:.1f}% reward={actor_agg['avg_sum_reward']:.3f}"
-        + f" | VLA: success={vla_agg['pc_success']:.1f}% reward={vla_agg['avg_sum_reward']:.3f}"
-        + f" | Delta: {actor_agg['pc_success'] - vla_agg['pc_success']:+.1f}%"
+        + f"\n  Actor(with_vla):    success={a_vla['pc_success']:.1f}%  reward={a_vla['avg_sum_reward']:.3f}"
+        + f"\n  Actor(independent): success={a_ind['pc_success']:.1f}%  reward={a_ind['avg_sum_reward']:.3f}"
+        + f"\n  VLA baseline:       success={vla['pc_success']:.1f}%  reward={vla['avg_sum_reward']:.3f}"
     )
 
     if wandb_logger:
         wandb_logger.log_dict({
-            "eval/actor_success": actor_agg["pc_success"],
-            "eval/actor_reward": actor_agg["avg_sum_reward"],
-            "eval/vla_success": vla_agg["pc_success"],
-            "eval/vla_reward": vla_agg["avg_sum_reward"],
-            "eval/actor_vs_vla_delta": actor_agg["pc_success"] - vla_agg["pc_success"],
+            "eval/actor_with_vla_success": a_vla["pc_success"],
+            "eval/actor_with_vla_reward": a_vla["avg_sum_reward"],
+            "eval/actor_independent_success": a_ind["pc_success"],
+            "eval/actor_independent_reward": a_ind["avg_sum_reward"],
+            "eval/vla_success": vla["pc_success"],
+            "eval/vla_reward": vla["avg_sum_reward"],
+            "eval/actor_with_vla_vs_vla": a_vla["pc_success"] - vla["pc_success"],
+            "eval/actor_independent_vs_vla": a_ind["pc_success"] - vla["pc_success"],
         }, step=step, mode="eval")
 
     close_envs(eval_env)
