@@ -60,6 +60,28 @@ lerobot-train \
     --env.type=aloha \
     --env.task=AlohaTransferCube-v0
 
+lerobot-train \
+    --dataset.repo_id=lerobot/aloha_sim_transfer_cube_scripted \
+    --policy.type=diffusion \
+    --steps=100000 \
+    --batch_size=64 \
+    --eval_freq=10000 \
+    --save_freq=20000 \
+    --dataset.image_transforms.enable=false \
+    --dataset.image_transforms.resize_to=[224,224] \
+    --policy.device=cuda \
+    --policy.use_amp=true \
+    --policy.push_to_hub=false \
+    --policy.pretrained_backbone_weights=IMAGENET1K_V1 \
+    --policy.vit_image_size=224 \
+    --policy.vision_backbone=vit_tiny_patch16_224 \
+    --policy.use_group_norm=false \
+    --policy.backbone_lr_scale=0.1 \
+    --wandb.enable=true \
+    --wandb.project=aloha_dp \
+    --env.type=aloha \
+    --env.task=AlohaTransferCube-v0
+
 
 lerobot-train     --dataset.repo_id=lerobot/aloha_sim_transfer_cube_human     --policy.type=mlp     --policy.chunk_size=50     --policy.n_action_steps=50     --policy.loss_type=l1     --policy.do_mask_loss_for_padding=true     --steps=100000     --batch_size=64     --eval_freq=10000     --save_freq=20000     --dataset.image_transforms.enable=false     --policy.device=cuda     --policy.use_amp=true     --policy.push_to_hub=false     --policy.pretrained_backbone_weights=ResNet18_Weights.IMAGENET1K_V1     --policy.use_group_norm=false     --policy.backbone_lr_scale=0.1     --wandb.enable=true     --wandb.project=aloha_mlp     --env.type=aloha     --env.task=AlohaTransferCube-v0
 
