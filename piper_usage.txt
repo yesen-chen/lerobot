@@ -1,0 +1,29 @@
+#设置比特率等：
+sudo ip link set can0 type can bitrate 1000000
+sudo ip link set can0 up
+#查看can连接
+ip link show can0
+python test_piper.py
+
+#piper数据采集的时候要注意一定要按钮是常亮的
+#在replay数据的时候按钮一定要是灭的
+
+python -m lerobot.scripts.lerobot_collect \
+  --robot.type=piper \
+  --robot.can_name=can0 \
+  --robot.cameras='{}' \
+  --teleop.type=piper_teach \
+  --teleop.can_name=can0 \
+  --teleop.teach_mode=button \
+  --dataset.repo_id=zhang/piper_pick_place \
+  --dataset.num_episodes=10 \
+  --dataset.single_task="pick_and_place" \
+  --dataset.push_to_hub=false \
+  --display_data=true
+
+lerobot-replay \
+  --robot.type=piper \
+  --robot.can_name=can0 \
+  --robot.cameras='{}' \
+  --dataset.repo_id=zhang/piper_pick_place_1642 \
+  --dataset.episode=0
