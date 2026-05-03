@@ -152,7 +152,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
             prev_chunk_left_over=kwargs.get("prev_chunk_left_over"),
             execution_horizon=kwargs.get("execution_horizon"),
         )
-        simluated_infer_latency = 0.15
+        simluated_infer_latency = 1.0
         time.sleep(simluated_infer_latency)
         logging.info(f"Simulated inference latency: {simluated_infer_latency} seconds")
         return actions

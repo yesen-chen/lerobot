@@ -109,6 +109,7 @@ from lerobot.robots import (  # noqa: F401
     make_robot_from_config,
     omx_follower,
     openarm_follower,
+    piper,
     reachy2,
     so_follower,
     unitree_g1 as unitree_g1_robot,
@@ -123,6 +124,7 @@ from lerobot.teleoperators import (  # noqa: F401
     make_teleoperator_from_config,
     omx_leader,
     openarm_leader,
+    piper_teach,
     reachy2_teleoperator,
     so_leader,
     unitree_g1,
@@ -587,6 +589,18 @@ def record_loop(
         preprocessor.reset()
         postprocessor.reset()
 
+    # Per-episode action EMA smoothing (only used in policy mode).
+    # alpha in [0, 1): higher = smoother but more lag. Set ACTION_EMA_ALPHA=0 to disable.
+    import os as _os
+    try:
+        action_ema_alpha = float(_os.environ.get("ACTION_EMA_ALPHA", "0.5"))
+    except ValueError:
+        action_ema_alpha = 0.5
+    action_ema_alpha = max(0.0, min(0.999, action_ema_alpha))
+    prev_action_smoothed: dict[str, float] = {}
+    if policy is not None and action_ema_alpha > 0.0:
+        logging.info(f"Action EMA smoothing enabled with alpha={action_ema_alpha}")
+
     timestamp = 0
     start_episode_t = time.perf_counter()
     while timestamp < control_time_s:
@@ -652,6 +666,20 @@ def record_loop(
         else:
             action_values = act_processed_teleop
             robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
+
+        # Action EMA smoothing for policy-driven control to suppress high-frequency jitter
+        # on robots without internal motor smoothing (e.g. Piper). Skipped for teleop.
+        if policy is not None and action_ema_alpha > 0.0:
+            for _k, _v in robot_action_to_send.items():
+                if isinstance(_v, bool) or not isinstance(_v, (int, float)):
+                    continue
+                _prev = prev_action_smoothed.get(_k)
+                if _prev is None:
+                    prev_action_smoothed[_k] = float(_v)
+                else:
+                    _smoothed = action_ema_alpha * _prev + (1.0 - action_ema_alpha) * float(_v)
+                    prev_action_smoothed[_k] = _smoothed
+                    robot_action_to_send[_k] = _smoothed
 
         # Compare commanded joint targets against current measured joint positions.
         # Useful to diagnose "robot not moving" when action deltas become too small.

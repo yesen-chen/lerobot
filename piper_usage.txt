@@ -27,3 +27,9 @@ lerobot-replay \
   --robot.cameras='{}' \
   --dataset.repo_id=zhang/piper_pick_place_1642 \
   --dataset.episode=0
+
+
+lerobot-train     --dataset.repo_id=0502/pick_pingu_1432     --policy.type=flow_matching     --steps=100000     --batch_size=64     --eval_freq=10000     --save_freq=10000     --dataset.image_transforms.enable=false     --dataset.image_transforms.resize_to=[224,224]     --policy.device=cuda     --policy.use_amp=true     --policy.push_to_hub=false     --policy.pretrained_backbone_weights=ResNet18_Weights.IMAGENET1K_V1     --policy.use_group_norm=false     --policy.backbone_lr_scale=0.1     --wandb.enable=true     --wandb.project=pick_pingu_fm
+
+
+ACTION_EMA_ALPHA=0.0 python -m lerobot.scripts.lerobot_infer     --robot.type=piper     --robot.can_name=can0     --robot.cameras='{ wrist: {type: opencv, index_or_path: "/dev/video1", width: 1280, height: 720, fps: 30} }'     --policy.path=/home/why/cys/lerobot/outputs/train/2026-05-02/15-13-02_flow_matching/checkpoints/050000/pretrained_model     --dataset.repo_id=0502/eval_pick_pingu_2028     --dataset.num_episodes=10     --dataset.single_task=pick_place     --dataset.push_to_hub=false     --dataset.episode_time_s=100000     --image_transforms.resize_to=[224,224]     --display_data=true --policy.num_inference_steps=10 --policy.num_inference_steps=10  --policy.solver_type=dopri5 

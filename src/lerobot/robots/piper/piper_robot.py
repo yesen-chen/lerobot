@@ -44,10 +44,7 @@ class PiperRobot(Robot):
 
     @property
     def _cameras_ft(self) -> dict[str, tuple]:
-        return {
-            f"observation.images.{cam_key}": (cam.height, cam.width, 3)
-            for cam_key, cam in self.cameras.items()
-        }
+        return {cam_key: (cam.height, cam.width, 3) for cam_key, cam in self.cameras.items()}
 
     @cached_property
     def observation_features(self) -> dict[str, type | tuple]:
@@ -78,8 +75,7 @@ class PiperRobot(Robot):
     def camera_features(self) -> dict:
         cam_ft = {}
         for cam_key, cam in self.cameras.items():
-            key = f"observation.images.{cam_key}"
-            cam_ft[key] = {
+            cam_ft[cam_key] = {
                 "shape": (cam.height, cam.width, cam.channels),
                 "names": ["height", "width", "channels"],
                 "info": None,
@@ -138,7 +134,7 @@ class PiperRobot(Robot):
         obs["gripper.pos"] = raw["gripper"] / GRIPPER_FACTOR
 
         for cam_key, cam in self.cameras.items():
-            obs[f"observation.images.{cam_key}"] = cam.async_read()
+            obs[cam_key] = cam.async_read()
 
         return obs
 

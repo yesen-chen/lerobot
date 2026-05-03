@@ -77,6 +77,17 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.constants import ACTION, DONE, OBS_STATE, REWARD
 
 
+def _str_to_bool(raw: str | bool) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    sl = str(raw).lower().strip()
+    if sl in ("true", "1", "yes", "y", "on"):
+        return True
+    if sl in ("false", "0", "no", "n", "off", ""):
+        return False
+    raise argparse.ArgumentTypeError(f"expected a boolean string, got {raw!r}")
+
+
 def to_hwc_uint8_numpy(chw_float32_torch: torch.Tensor) -> np.ndarray:
     assert chw_float32_torch.dtype == torch.float32
     assert chw_float32_torch.ndim == 3
@@ -265,10 +276,9 @@ def main():
 
     parser.add_argument(
         "--display-compressed-images",
-        type=bool,
-        required=True,
+        type=_str_to_bool,
         default=False,
-        help="If set, display compressed images in Rerun instead of uncompressed ones.",
+        help="If true, JPEG-compress frames in Rerun (saves bandwidth; default is false).",
     )
 
     parser.add_argument(
