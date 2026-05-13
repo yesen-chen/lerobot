@@ -1,0 +1,24 @@
+1.数据采集
+数据：机器人数据state(本体感知，本地只用了关节角，无eef pose6维) 机器人数据action(关节角，或者输出eef pose通过ik得到电机的joint) 相机数据
+#motors/piper
+#robot/piper
+#teleop/piper
+数据采集脚本：scripts/lerobot_collect
+
+2.数据检查
+#replay：加载我的数据里面的动作，让机器人执行
+
+#visualize:rerun可视化可播放检查
+
+数据是否丢失，检查动作是否准确。
+
+
+
+3.模型训练
+
+模型学习的是：如何根据我机器人当前的观测去执行动作 pi(action | obs)
+#policies/ACT diffusion policy
+
+
+
+4.模型推理部署

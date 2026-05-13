@@ -16,6 +16,7 @@
 Provides the OpenCVCamera class for capturing frames from cameras using OpenCV.
 """
 
+import contextlib
 import logging
 import math
 import os
@@ -46,6 +47,25 @@ from .configuration_opencv import ColorMode, OpenCVCameraConfig
 MAX_OPENCV_INDEX = 60
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def _suppress_c_stderr():
+    """Redirect file-descriptor-level stderr to /dev/null.
+
+    Needed to suppress low-level V4L2/FFMPEG probe messages (e.g.
+    "ioctl(VIDIOC_QBUF): Bad file descriptor") that bypass Python's
+    logging and write directly to the C stderr file descriptor.
+    """
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    saved_stderr_fd = os.dup(2)
+    try:
+        os.dup2(devnull_fd, 2)
+        yield
+    finally:
+        os.dup2(saved_stderr_fd, 2)
+        os.close(saved_stderr_fd)
+        os.close(devnull_fd)
 
 
 class OpenCVCamera(Camera):
@@ -155,10 +175,12 @@ class OpenCVCamera(Camera):
         # blocking in multi-threaded applications, especially during data collection.
         cv2.setNumThreads(1)
 
-        self.videocapture = cv2.VideoCapture(self.index_or_path, self.backend)
+        with _suppress_c_stderr():
+            self.videocapture = cv2.VideoCapture(self.index_or_path, self.backend)
 
         if not self.videocapture.isOpened():
-            self.videocapture.release()
+            with _suppress_c_stderr():
+                self.videocapture.release()
             self.videocapture = None
             raise ConnectionError(
                 f"Failed to open {self}.Run `lerobot-find-cameras opencv` to find available cameras."
@@ -234,9 +256,17 @@ class OpenCVCamera(Camera):
 
         success = self.videocapture.set(cv2.CAP_PROP_FPS, float(self.fps))
         actual_fps = self.videocapture.get(cv2.CAP_PROP_FPS)
-        # Use math.isclose for robust float comparison
-        if not success or not math.isclose(self.fps, actual_fps, rel_tol=1e-3):
-            raise RuntimeError(f"{self} failed to set fps={self.fps} ({actual_fps=}).")
+        # Use math.isclose for robust float comparison.
+        # Some backends (notably FFMPEG/V4L2) return success=False even when the
+        # property is already at the requested value. Treat a matching actual
+        # value as success regardless of the success flag.
+        if not math.isclose(self.fps, actual_fps, rel_tol=1e-3):
+            raise RuntimeError(f"{self} failed to set fps={self.fps} ({actual_fps=}, {success=}).")
+        if not success:
+            logger.warning(
+                f"{self} backend reported set(CAP_PROP_FPS) failure but actual fps matches "
+                f"({actual_fps=}); continuing."
+            )
 
     def _validate_fourcc(self) -> None:
         """Validates and sets the camera's FOURCC code."""
@@ -271,16 +301,29 @@ class OpenCVCamera(Camera):
         width_success = self.videocapture.set(cv2.CAP_PROP_FRAME_WIDTH, float(self.capture_width))
         height_success = self.videocapture.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self.capture_height))
 
+        # Some backends (notably FFMPEG/V4L2) return success=False even when
+        # the property is already at the requested value. Treat a matching
+        # actual value as success regardless of the success flag.
         actual_width = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_WIDTH)))
-        if not width_success or self.capture_width != actual_width:
+        if self.capture_width != actual_width:
             raise RuntimeError(
                 f"{self} failed to set capture_width={self.capture_width} ({actual_width=}, {width_success=})."
             )
+        if not width_success:
+            logger.warning(
+                f"{self} backend reported set(CAP_PROP_FRAME_WIDTH) failure but actual width "
+                f"matches ({actual_width=}); continuing."
+            )
 
         actual_height = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-        if not height_success or self.capture_height != actual_height:
+        if self.capture_height != actual_height:
             raise RuntimeError(
                 f"{self} failed to set capture_height={self.capture_height} ({actual_height=}, {height_success=})."
+            )
+        if not height_success:
+            logger.warning(
+                f"{self} backend reported set(CAP_PROP_FRAME_HEIGHT) failure but actual height "
+                f"matches ({actual_height=}); continuing."
             )
 
     @staticmethod
@@ -306,34 +349,42 @@ class OpenCVCamera(Camera):
             targets_to_scan = [int(i) for i in range(MAX_OPENCV_INDEX)]
 
         for target in targets_to_scan:
-            camera = cv2.VideoCapture(target)
-            if camera.isOpened():
-                default_width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
-                default_height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                default_fps = camera.get(cv2.CAP_PROP_FPS)
-                default_format = camera.get(cv2.CAP_PROP_FORMAT)
+            # Suppress C-level stderr for the entire probe cycle (open, query,
+            # release) to hide V4L2 backend noise (e.g. "ioctl(VIDIOC_QBUF):
+            # Bad file descriptor") that appears when OpenCV tries V4L2 before
+            # falling back to FFMPEG on Linux.
+            with _suppress_c_stderr():
+                camera = cv2.VideoCapture(target)
+                if camera.isOpened():
+                    default_width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    default_height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    default_fps = camera.get(cv2.CAP_PROP_FPS)
 
-                # Get FOURCC code and convert to string
-                default_fourcc_code = camera.get(cv2.CAP_PROP_FOURCC)
-                default_fourcc_code_int = int(default_fourcc_code)
-                default_fourcc = "".join([chr((default_fourcc_code_int >> 8 * i) & 0xFF) for i in range(4)])
+                    # Get FOURCC code and convert to string
+                    default_fourcc_code = camera.get(cv2.CAP_PROP_FOURCC)
+                    default_fourcc_code_int = int(default_fourcc_code)
+                    default_fourcc = "".join([chr((default_fourcc_code_int >> 8 * i) & 0xFF) for i in range(4)])
 
-                camera_info = {
-                    "name": f"OpenCV Camera @ {target}",
-                    "type": "OpenCV",
-                    "id": target,
-                    "backend_api": camera.getBackendName(),
-                    "default_stream_profile": {
-                        "format": default_format,
-                        "fourcc": default_fourcc,
-                        "width": default_width,
-                        "height": default_height,
-                        "fps": default_fps,
-                    },
-                }
+                    # CAP_PROP_FORMAT returns a meaningless numeric value with the
+                    # FFMPEG backend; use the FOURCC string as the canonical format.
+                    display_format = default_fourcc if default_fourcc.strip("\x00") else "unknown"
 
-                found_cameras_info.append(camera_info)
-                camera.release()
+                    camera_info = {
+                        "name": f"OpenCV Camera @ {target}",
+                        "type": "OpenCV",
+                        "id": target,
+                        "backend_api": camera.getBackendName(),
+                        "default_stream_profile": {
+                            "format": display_format,
+                            "fourcc": default_fourcc,
+                            "width": default_width,
+                            "height": default_height,
+                            "fps": default_fps,
+                        },
+                    }
+
+                    found_cameras_info.append(camera_info)
+                    camera.release()
 
         return found_cameras_info
 
@@ -586,7 +637,8 @@ class OpenCVCamera(Camera):
             self._stop_read_thread()
 
         if self.videocapture is not None:
-            self.videocapture.release()
+            with _suppress_c_stderr():
+                self.videocapture.release()
             self.videocapture = None
 
         with self.frame_lock:

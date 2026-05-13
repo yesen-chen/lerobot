@@ -11,7 +11,7 @@ python test_piper.py
 python -m lerobot.scripts.lerobot_collect \
   --robot.type=piper \
   --robot.can_name=can0 \
-  --robot.cameras='{}' \
+  --robot.cameras='{ wrist: {type: opencv, index_or_path: "/dev/video0", width: 1280, height: 720, fps: 30} }' \
   --teleop.type=piper_teach \
   --teleop.can_name=can0 \
   --teleop.teach_mode=button \
@@ -24,12 +24,39 @@ python -m lerobot.scripts.lerobot_collect \
 lerobot-replay \
   --robot.type=piper \
   --robot.can_name=can0 \
-  --robot.cameras='{}' \
+  --robot.cameras='{ wrist: {type: opencv, index_or_path: "/dev/video0", width: 1280, height: 720, fps: 30} }' \
   --dataset.repo_id=zhang/piper_pick_place_1642 \
   --dataset.episode=0
+
+lerobot-dataset-viz     --repo-id 0512/locate_25ep_bright     --episode-index 0     --display-compressed-images False     --video-backend pyav     --num-workers 0
 
 
 lerobot-train     --dataset.repo_id=0502/pick_pingu_1432     --policy.type=flow_matching     --steps=100000     --batch_size=64     --eval_freq=10000     --save_freq=10000     --dataset.image_transforms.enable=false     --dataset.image_transforms.resize_to=[224,224]     --policy.device=cuda     --policy.use_amp=true     --policy.push_to_hub=false     --policy.pretrained_backbone_weights=ResNet18_Weights.IMAGENET1K_V1     --policy.use_group_norm=false     --policy.backbone_lr_scale=0.1     --wandb.enable=true     --wandb.project=pick_pingu_fm
 
 
-ACTION_EMA_ALPHA=0.0 python -m lerobot.scripts.lerobot_infer     --robot.type=piper     --robot.can_name=can0     --robot.cameras='{ wrist: {type: opencv, index_or_path: "/dev/video1", width: 1280, height: 720, fps: 30} }'     --policy.path=/home/why/cys/lerobot/outputs/train/2026-05-02/15-13-02_flow_matching/checkpoints/050000/pretrained_model     --dataset.repo_id=0502/eval_pick_pingu_2028     --dataset.num_episodes=10     --dataset.single_task=pick_place     --dataset.push_to_hub=false     --dataset.episode_time_s=100000     --image_transforms.resize_to=[224,224]     --display_data=true --policy.num_inference_steps=10 --policy.num_inference_steps=10  --policy.solver_type=dopri5 
+python -m lerobot.scripts.lerobot_infer     --robot.type=piper     --robot.can_name=can0     --robot.cameras='{ wrist: {type: opencv, index_or_path: "/dev/video1", width: 1280, height: 720, fps: 30} }'     --policy.path=/home/why/cys/lerobot/outputs/train/2026-05-02/15-13-02_flow_matching/checkpoints/050000/pretrained_model     --dataset.repo_id=0502/eval_pick_pingu_2028     --dataset.num_episodes=10     --dataset.single_task=pick_place     --dataset.push_to_hub=false     --dataset.episode_time_s=100000     --image_transforms.resize_to=[224,224]     --display_data=true --policy.num_inference_steps=10 --policy.num_inference_steps=10  --policy.solver_type=dopri5 
+
+
+# ===== wrist 相机视角校准 =====
+# 思路：在固定关节位处拍参考图；之后想验证相机角度有没有变，再走到该关节位、把当前帧
+# 与参考图做配准（ECC/ORB），输出 dx/dy/rot/scale 和 PASS/WARN/FAIL，并提供 overlay 可视化。
+# 注意：record 与 verify 必须使用完全相同的 --robot.cameras 配置（分辨率/旋转/色彩模式），
+# 否则脚本会主动拒绝执行。脚本会强制等到关节静止再抓帧。
+
+# 1) 录制参考（首次或重装相机后做一次）：示教模式拖到目标观察位 -> 回车 -> 自动锁位 -> 抓 N 帧中位数 -> 落盘到 outputs/wrist_calib/<name>/
+python -m lerobot.scripts.lerobot_wrist_calib record \
+  --name=v1 \
+  --robot.type=piper --robot.can_name=can0 \
+  --robot.cameras='{ wrist: {type: opencv, index_or_path: "/dev/video0", width: 1280, height: 720, fps: 30} }' \
+  --camera_key=wrist \
+  --avg_frames=10 --settle_eps=0.002 --settle_window=10
+
+# 2) 校验：自动走到记录关节位 -> 实时窗口显示参考/当前/差异三联屏 + HUD（dx/dy/rot/scale/score/PASS-WARN-FAIL）
+#    快捷键: q 退出 | s 保存当前帧+视图+指标到 diagnostics/ | e 切 alpha/edge overlay | b 切 ecc/orb backend | m 切 ECC 运动模型
+python -m lerobot.scripts.lerobot_wrist_calib verify \
+  --name=v1 \
+  --robot.type=piper --robot.can_name=can0 \
+  --robot.cameras='{ wrist: {type: opencv, index_or_path: "/dev/video0", width: 1920, height: 1080, fps: 30} }' \
+  --camera_key=wrist \
+  --backend=ecc --ecc_motion=euclidean
+
